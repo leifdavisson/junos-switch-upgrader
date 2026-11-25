@@ -1,0 +1,20 @@
+name: Feature Request
+description: Suggest an improvement, new platform policy, or workflow enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What operational or upgrade workflow problem does this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the CLI flags, behavior, or platform policy changes you have in mind.
+    validations:
+      required: true

@@ -1,0 +1,607 @@
+schema_version: 2
+updated: '2026-11-21'
+firmware_server_base_url: http://firmware-cache.example.internal
+platforms:
+- model_pattern: ex2300-*mp*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-arm-32
+  expected_arch: arm-32
+  prefer_http_stream: true
+  min_free_storage_mb: 250
+  boot_timeout_seconds: 660
+  download_portal_slug: EX2300
+  known_advisories:
+  - EX2300-MP mGig models require PoE/mGig PHY firmware compatibility check via `show
+    chassis firmware`.
+  - EX2300 uses a 1.3 GB /.mount partition; stream via `no-copy unlink` over HTTP
+    when <600 MB free.
+  hops:
+  - train: '18.4'
+    target_version: 18.4R3-S15
+    package_filename: junos-arm-32-18.4R3-S15.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '19.3'
+    target_version: 19.3R3-S7
+    package_filename: junos-arm-32-19.3R3-S7.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '20.2'
+    target_version: 20.2R3-S9
+    package_filename: junos-arm-32-20.2R3-S9.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '21.2'
+    target_version: 21.2R3-S8
+    package_filename: junos-arm-32-21.2R3-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+    notes: Cross-BSD transition (<=21.1 to >=21.2 requires no-validate)
+  - train: '22.2'
+    target_version: 22.2R3-S5
+    package_filename: junos-arm-32-22.2R3-S5.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '23.2'
+    target_version: 23.2R2-S3
+    package_filename: junos-arm-32-23.2R2-S3.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-arm-32-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex2300*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-arm-32
+  expected_arch: arm-32
+  prefer_http_stream: true
+  min_free_storage_mb: 250
+  boot_timeout_seconds: 600
+  download_portal_slug: EX2300
+  known_advisories:
+  - EX2300/EX2300-C uses a 1.3 GB /.mount partition; stream via `no-copy unlink` over
+    HTTP when <600 MB free.
+  hops:
+  - train: '18.4'
+    target_version: 18.4R3-S15
+    package_filename: junos-arm-32-18.4R3-S15.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '19.3'
+    target_version: 19.3R3-S7
+    package_filename: junos-arm-32-19.3R3-S7.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '20.2'
+    target_version: 20.2R3-S9
+    package_filename: junos-arm-32-20.2R3-S9.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '21.2'
+    target_version: 21.2R3-S8
+    package_filename: junos-arm-32-21.2R3-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.2'
+    target_version: 22.2R3-S5
+    package_filename: junos-arm-32-22.2R3-S5.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '23.2'
+    target_version: 23.2R2-S3
+    package_filename: junos-arm-32-23.2R2-S3.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-arm-32-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex3400*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-arm-32
+  expected_arch: arm-32
+  prefer_http_stream: false
+  min_free_storage_mb: 600
+  boot_timeout_seconds: 600
+  download_portal_slug: EX3400
+  hops:
+  - train: '18.4'
+    target_version: 18.4R3-S15
+    package_filename: junos-arm-32-18.4R3-S15.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '19.3'
+    target_version: 19.3R3-S7
+    package_filename: junos-arm-32-19.3R3-S7.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '20.2'
+    target_version: 20.2R3-S9
+    package_filename: junos-arm-32-20.2R3-S9.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '21.2'
+    target_version: 21.2R3-S8
+    package_filename: junos-arm-32-21.2R3-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.2'
+    target_version: 22.2R3-S5
+    package_filename: junos-arm-32-22.2R3-S5.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '23.2'
+    target_version: 23.2R2-S3
+    package_filename: junos-arm-32-23.2R2-S3.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-arm-32-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex4100-*mp*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-install-ex-arm-64
+  expected_arch: arm-64
+  prefer_http_stream: false
+  min_free_storage_mb: 1000
+  boot_timeout_seconds: 600
+  download_portal_slug: EX4100
+  known_advisories:
+  - EX4100-MP requires ARM-64 image (`junos-install-ex-arm-64-*`) and PoE/mGig PHY
+    verification.
+  hops:
+  - train: '22.2'
+    target_version: 22.2R3-S5
+    package_filename: junos-install-ex-arm-64-22.2R3-S5.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '23.2'
+    target_version: 23.2R2-S3
+    package_filename: junos-install-ex-arm-64-23.2R2-S3.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-install-ex-arm-64-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex4100*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-install-ex-arm-64
+  expected_arch: arm-64
+  prefer_http_stream: false
+  min_free_storage_mb: 1000
+  boot_timeout_seconds: 600
+  download_portal_slug: EX4100
+  hops:
+  - train: '22.2'
+    target_version: 22.2R3-S5
+    package_filename: junos-install-ex-arm-64-22.2R3-S5.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '23.2'
+    target_version: 23.2R2-S3
+    package_filename: junos-install-ex-arm-64-23.2R2-S3.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-install-ex-arm-64-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex4300-48mp*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: jinstall-host-ex-4300mp
+  expected_arch: x86-64-vmhost
+  prefer_http_stream: false
+  min_free_storage_mb: 1500
+  boot_timeout_seconds: 720
+  download_portal_slug: EX4300-48MP
+  known_advisories:
+  - 'CRITICAL: EX4300-48MP (mGig) uses x86 VMHost architecture (`jinstall-host-ex-4300mp-*`),
+    NOT standard EX4300 PowerPC (`jinstall-ex-4300-*`)!'
+  - Requires `force-host` to keep Linux host OS synchronized with Junos VM.
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: jinstall-host-ex-4300mp-21.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: jinstall-host-ex-4300mp-22.4R3-S7-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: jinstall-host-ex-4300mp-23.4R2-S8-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+- model_pattern: ex4300*
+  vendor: juniper
+  role_scope: access
+  final_target: 21.4R3-S12
+  package_family: jinstall-ex-4300
+  expected_arch: powerpc
+  prefer_http_stream: false
+  min_free_storage_mb: 600
+  boot_timeout_seconds: 600
+  download_portal_slug: EX4300
+  known_advisories:
+  - EX4300 non-MP (PowerPC) EOS is March 2029; max supported train is 21.4R3.
+  hops:
+  - train: '19.4'
+    target_version: 19.4R3-S12
+    package_filename: jinstall-ex-4300-19.4R3-S12-domestic-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: '20.4'
+    target_version: 20.4R3-S10
+    package_filename: jinstall-ex-4300-20.4R3-S10-domestic-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 21.4R3-S12
+    target_version: 21.4R3-S12
+    package_filename: jinstall-ex-4300-21.4R3-S12-domestic-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+- model_pattern: ex4400-*mp*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-install-ex-x86-64
+  expected_arch: x86-64
+  prefer_http_stream: false
+  min_free_storage_mb: 1200
+  boot_timeout_seconds: 660
+  download_portal_slug: EX4400
+  known_advisories:
+  - EX4400-MP uses x86-64 image (`junos-install-ex-x86-64-*`); verify UPOE/mGig PHY
+    firmware post-upgrade.
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: junos-install-ex-x86-64-21.4R3-S12.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: junos-install-ex-x86-64-22.4R3-S7.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-install-ex-x86-64-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex4400*
+  vendor: juniper
+  role_scope: access
+  final_target: 23.4R2-S8
+  package_family: junos-install-ex-x86-64
+  expected_arch: x86-64
+  prefer_http_stream: false
+  min_free_storage_mb: 1200
+  boot_timeout_seconds: 660
+  download_portal_slug: EX4400
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: junos-install-ex-x86-64-21.4R3-S12.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: junos-install-ex-x86-64-22.4R3-S7.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: junos-install-ex-x86-64-23.4R2-S8.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options: []
+    release_notes_reviewed: false
+- model_pattern: ex4600*
+  vendor: juniper
+  role_scope: core
+  final_target: 21.4R3-S12
+  package_family: jinstall-host-qfx-5
+  expected_arch: qfx-5
+  prefer_http_stream: false
+  min_free_storage_mb: 1500
+  boot_timeout_seconds: 720
+  download_portal_slug: EX4600
+  known_advisories:
+  - EX4600 requires `force-host` so Junos and Host OS stay aligned.
+  hops:
+  - train: '18.2'
+    target_version: 18.2R3-S10
+    package_filename: jinstall-host-qfx-5-18.2R3-S10-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '19.1'
+    target_version: 19.1R3-S9
+    package_filename: jinstall-host-qfx-5-19.1R3-S9-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '19.4'
+    target_version: 19.4R3-S12
+    package_filename: jinstall-host-qfx-5-19.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '20.4'
+    target_version: 20.4R3-S10
+    package_filename: jinstall-host-qfx-5-20.4R3-S10-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: 21.4R3-S12
+    target_version: 21.4R3-S12
+    package_filename: jinstall-host-qfx-5-21.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+- model_pattern: ex4650*
+  vendor: juniper
+  role_scope: core
+  final_target: 23.4R2-S8
+  package_family: jinstall-host-ex-4650
+  expected_arch: ex-4650
+  prefer_http_stream: false
+  min_free_storage_mb: 1500
+  boot_timeout_seconds: 720
+  download_portal_slug: EX4650
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: jinstall-host-ex-4650-21.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: jinstall-host-ex-4650-22.4R3-S7-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: jinstall-host-ex-4650-23.4R2-S8-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+- model_pattern: qfx5120*
+  vendor: juniper
+  role_scope: core
+  final_target: 23.4R2-S8
+  package_family: jinstall-host-qfx-5e
+  expected_arch: qfx-5e
+  prefer_http_stream: false
+  min_free_storage_mb: 1500
+  boot_timeout_seconds: 720
+  download_portal_slug: QFX5120
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: jinstall-host-qfx-5e-21.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: jinstall-host-qfx-5e-22.4R3-S7-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: jinstall-host-qfx-5e-23.4R2-S8-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+- model_pattern: qfx5200*
+  vendor: juniper
+  role_scope: core
+  final_target: 23.4R2-S8
+  package_family: jinstall-host-qfx-5e
+  expected_arch: qfx-5e
+  prefer_http_stream: false
+  min_free_storage_mb: 1500
+  boot_timeout_seconds: 720
+  download_portal_slug: QFX5200
+  known_advisories:
+  - QFX5200 uses `jinstall-host-qfx-5e-*` on standard Junos OS; if running Junos OS
+    Evolved (`junos-evo`), block classical images.
+  hops:
+  - train: '21.4'
+    target_version: 21.4R3-S12
+    package_filename: jinstall-host-qfx-5e-21.4R3-S12-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: '22.4'
+    target_version: 22.4R3-S7
+    package_filename: jinstall-host-qfx-5e-22.4R3-S7-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+  - train: 23.4R2-S8
+    target_version: 23.4R2-S8
+    package_filename: jinstall-host-qfx-5e-23.4R2-S8-signed.tgz
+    checksum_type: md5
+    checksum: REPLACE_WITH_JUNIPER_MD5
+    install_options:
+    - force-host
+    - no-validate
+    release_notes_reviewed: false
+excluded_families:
+- pattern: ex2200*
+  policy: "EOL / unsupported Juniper EX2200 \u2014 schedule hardware replacement."
+- pattern: ex3200*
+  policy: "EOL / unsupported Juniper EX3200 \u2014 schedule hardware replacement."
+- pattern: ex3300*
+  policy: "EOL / unsupported Juniper EX3300 \u2014 schedule hardware replacement."
+- pattern: ex4200*
+  policy: "EOL / unsupported Juniper EX4200 \u2014 schedule hardware replacement."
+- pattern: ex4500*
+  policy: "EOL / unsupported Juniper EX4500 \u2014 schedule hardware replacement."
+- pattern: ex4550*
+  policy: "EOL / unsupported Juniper EX4550 \u2014 schedule hardware replacement."
+- pattern: qfx3500*
+  policy: "EOL / unsupported Juniper QFX3500 \u2014 schedule hardware replacement."
+- pattern: qfx5100*
+  policy: "EOL / unsupported Juniper QFX5100 \u2014 schedule hardware replacement."
+- pattern: hp*
+  policy: Retain known-good firmware; exclude HP/ProCurve from Juniper upgrade campaign.
+- pattern: aruba*
+  policy: Retain known-good firmware; exclude ArubaOS-S from Juniper upgrade campaign.
+- pattern: procurve*
+  policy: Retain known-good firmware; exclude ProCurve from Juniper upgrade campaign.
