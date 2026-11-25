@@ -333,7 +333,7 @@ def upgrade_single_switch(
                     _persist()
                     return work_sw
 
-                expected_remote = f"/var/tmp/{hop.package_filename}"
+                expected_remote = f"/var/tmp/{hop.package_filename}"  # nosec B108
                 if work_sw.staged_package == expected_remote:
                     ok_existing, _ = driver.verify_staged_checksum(
                         transport,
@@ -387,7 +387,7 @@ def upgrade_single_switch(
                 return work_sw
 
             # Check whether this hop was already staged cleanly onto /var/tmp
-            expected_remote = f"/var/tmp/{hop.package_filename}"
+            expected_remote = f"/var/tmp/{hop.package_filename}"  # nosec B108
             transfer: TransferOutcome | None = None
             if work_sw.staged_package == expected_remote:
                 ok_staged, _ = driver.verify_staged_checksum(

@@ -1031,7 +1031,12 @@ def precheck_cmd(
     type=click.Choice(["auto", "http", "http-stream", "scp"]),
     default="auto",
 )
-@click.option("--bind-host", default="0.0.0.0", show_default=True, help="HTTP server bind address")
+@click.option(
+    "--bind-host",
+    default="0.0.0.0",  # nosec B104
+    show_default=True,
+    help="HTTP server bind address",
+)
 @click.option("--http-port", type=click.IntRange(0, 65535), default=8080, show_default=True)
 @click.option(
     "--allow-remote-ui", is_flag=True, help="Allow non-loopback clients to access topology UI"
@@ -1249,7 +1254,12 @@ def stage_cmd(
     type=click.Choice(["auto", "http", "http-stream", "scp"]),
     default="auto",
 )
-@click.option("--bind-host", default="0.0.0.0", show_default=True, help="HTTP server bind address")
+@click.option(
+    "--bind-host",
+    default="0.0.0.0",  # nosec B104
+    show_default=True,
+    help="HTTP server bind address",
+)
 @click.option("--http-port", type=click.IntRange(0, 65535), default=8080, show_default=True)
 @click.option(
     "--allow-remote-ui", is_flag=True, help="Allow non-loopback clients to access topology UI"

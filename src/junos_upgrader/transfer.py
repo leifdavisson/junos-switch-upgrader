@@ -307,7 +307,7 @@ class UnifiedFirmwareServer:
         firmware_dir: Path,
         topology_provider: Callable[[], dict[str, Any]] | None = None,
         port: int = 8080,
-        bind_host: str = "0.0.0.0",
+        bind_host: str = "0.0.0.0",  # nosec B104
         allow_remote_ui: bool = False,
         allowed_clients: set[str] | None = None,
         html_provider: Callable[[], str] | None = None,
@@ -378,7 +378,7 @@ class UnifiedFirmwareServer:
         if self.port <= 0:
             raise RuntimeError("UnifiedFirmwareServer must be started before building URLs.")
         target_is_loopback = _is_loopback_host(target_switch_ip)
-        if self.bind_host not in ("0.0.0.0", "::", ""):
+        if self.bind_host not in ("0.0.0.0", "::", ""):  # nosec B104
             if _is_loopback_host(self.bind_host) and not target_is_loopback:
                 raise RuntimeError(
                     f"HTTP server is bound to loopback ({self.bind_host}) and unreachable from "
@@ -528,7 +528,10 @@ def stage_or_stream_package(
             details=f"Streaming directly via HTTP (`no-copy unlink`) from {local_url}",
         )
 
-    remote_pkg = validate_cli_target(f"/var/tmp/{safe_filename}", "remote package path")
+    remote_pkg = validate_cli_target(
+        f"/var/tmp/{safe_filename}",  # nosec B108
+        "remote package path",
+    )
     if local_url and chosen in ("http", "external-http", "http-with-scp-fallback"):
         http_err = ""
         try:

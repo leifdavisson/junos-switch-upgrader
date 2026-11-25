@@ -192,7 +192,7 @@ class JunosSwitchDriver:
 
         try:
             clean_remote = validate_cli_target(remote_path, "remote_path")
-            if not clean_remote.startswith("/var/tmp/") or ".." in clean_remote:
+            if not clean_remote.startswith("/var/tmp/") or ".." in clean_remote:  # nosec B108
                 return False, f"Remote path must be a direct file under /var/tmp/: {remote_path!r}"
             validate_package_filename(Path(clean_remote).name)
         except ValueError as exc:

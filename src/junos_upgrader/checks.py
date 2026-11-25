@@ -263,7 +263,7 @@ def parse_junos_storage(storage_output: str) -> tuple[int | None, dict[str, int]
             if avail_mb is not None:
                 mounts[mount] = avail_mb
 
-    for preferred in ("/var/tmp", "/var", "/.mount", "/"):
+    for preferred in ("/var/tmp", "/var", "/.mount", "/"):  # nosec B108
         if preferred in mounts:
             return mounts[preferred], mounts
     return None, mounts
@@ -525,8 +525,8 @@ def _extract_safe_var_tmp_tgz_paths(tmp_list: str) -> list[str]:
         else:
             token = parts[-1]
 
-        if token.startswith("/var/tmp/"):
-            candidate_name = token[len("/var/tmp/") :]
+        if token.startswith("/var/tmp/"):  # nosec B108
+            candidate_name = token[len("/var/tmp/") :]  # nosec B108
         elif "/" in token or "\\" in token:
             continue
         else:
@@ -534,7 +534,7 @@ def _extract_safe_var_tmp_tgz_paths(tmp_list: str) -> list[str]:
 
         if ".." in candidate_name or not SAFE_PACKAGE_FILENAME_RE.fullmatch(candidate_name):
             continue
-        full_path = f"/var/tmp/{candidate_name}"
+        full_path = f"/var/tmp/{candidate_name}"  # nosec B108
         if full_path not in seen:
             seen.add(full_path)
             paths.append(full_path)
@@ -564,7 +564,7 @@ def auto_cleanup_storage(
                 continue
             transport.run_command(f"file delete {full_path}")
         # Junos `request system storage cleanup` purges /var/tmp/*; skip it when preserving a pre-staged image
-        if not any(p.startswith("/var/tmp/") for p in preserved):
+        if not any(p.startswith("/var/tmp/") for p in preserved):  # nosec B108
             clean_out = transport.run_command(
                 "request system storage cleanup no-confirm", read_timeout=120
             )
@@ -594,10 +594,10 @@ def evaluate_hardware_and_fs_triage(
 
     preserve: set[str] | None = None
     # Only preserve when an image is actually staged on-device under /var/tmp/
-    if switch.staged_package and switch.staged_package.startswith("/var/tmp/"):
+    if switch.staged_package and switch.staged_package.startswith("/var/tmp/"):  # nosec B108
         staged_name = Path(switch.staged_package).name
         if not expected_hop_filename or staged_name == expected_hop_filename:
-            preserve = {f"/var/tmp/{staged_name}"}
+            preserve = {f"/var/tmp/{staged_name}"}  # nosec B108
     free_mb, _ = auto_cleanup_storage(
         transport,
         evidence_dir,

@@ -215,8 +215,8 @@ def inspect_local_tgz(path: Path) -> PackageMetadata:
         return meta
 
     # Compute MD5, SHA1, and SHA256 in a single streaming pass
-    md5_h = hashlib.md5()
-    sha1_h = hashlib.sha1()
+    md5_h = hashlib.md5(usedforsecurity=False)
+    sha1_h = hashlib.sha1(usedforsecurity=False)
     sha256_h = hashlib.sha256()
     try:
         with path.open("rb") as fh:
