@@ -238,6 +238,30 @@ def test_absent_psu_slot_without_hw_alarms_is_not_replace_recommended(tmp_path: 
     )
     assert verdict_bad == TriageVerdict.REPLACE_RECOMMENDED
 
+    # Benign Minor "Rescue configuration is not set" system alarm must warn, NOT fail/quarantine
+    sw_rescue = _make_sw("RESCUE_UNSET_SW")
+    tr_rescue = FakeJunosTransport(
+        hostname=sw_rescue.hostname,
+        model=sw_rescue.model,
+        serial_number=sw_rescue.serial_number,
+        running_version=sw_rescue.current_version,
+        sys_alarms=(
+            "1 alarms currently active\n"
+            "Alarm time               Class  Description\n"
+            "2026-07-31 03:48:14 PDT  Minor  Rescue configuration is not set"
+        ),
+        chas_alarms="No alarms currently active",
+    )
+    verdict_rescue, checks_rescue = evaluate_hardware_and_fs_triage(
+        tr_rescue, sw_rescue, pol, tmp_path / "ev_rescue", tmp_path / "cfg_rescue"
+    )
+    assert verdict_rescue in (TriageVerdict.ELIGIBLE, TriageVerdict.NEEDS_REMEDIATION)
+    assert sw_rescue.state == SwitchState.READY
+    assert any(
+        c.name == "chassis_health" and c.passed and not c.hard_stop and c.severity == "warn"
+        for c in checks_rescue
+    )
+
 
 def test_missing_local_tgz_warns_in_validation_and_rejects_example_url(tmp_path: Path) -> None:
     base_url, policies, _ = load_release_catalog(RELEASES_YML)

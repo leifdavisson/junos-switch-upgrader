@@ -692,15 +692,23 @@ def evaluate_hardware_and_fs_triage(
         and "/var partition usage is high" in sys_alarms
         and (free_mb is not None and free_mb >= policy.min_free_storage_mb)
     )
+    only_rescue_unset_alarm = (
+        alarm_bad
+        and not chas_non_var_alarm
+        and not hw_fault
+        and "1 alarms currently active" in sys_alarms
+        and "rescue configuration is not set" in sys_alarms.lower()
+    )
+    benign_minor_alarm = only_var_usage_alarm or only_rescue_unset_alarm
     checks.append(
         CheckResult(
             name="chassis_health",
-            passed=not (hw_fault or (alarm_bad and not only_var_usage_alarm)),
-            hard_stop=(hw_fault or (alarm_bad and not only_var_usage_alarm)),
+            passed=not (hw_fault or (alarm_bad and not benign_minor_alarm)),
+            hard_stop=(hw_fault or (alarm_bad and not benign_minor_alarm)),
             severity=(
                 "replace"
                 if hw_fault
-                else ("warn" if only_var_usage_alarm else ("fail" if alarm_bad else "info"))
+                else ("warn" if benign_minor_alarm else ("fail" if alarm_bad else "info"))
             ),
             message=(
                 "Chassis environment OK and zero active alarms."
@@ -708,7 +716,11 @@ def evaluate_hardware_and_fs_triage(
                 else (
                     "Minor storage usage alarm active (/var partition usage is high) — auto-cleanup enabled for install."
                     if only_var_usage_alarm
-                    else f"Hardware/alarm fault: env_fault={hw_fault}, sys={sys_alarms.strip()!r}, chas={chas_alarms.strip()!r}"
+                    else (
+                        "Minor system alarm active (Rescue configuration is not set) — will be saved during backup."
+                        if only_rescue_unset_alarm
+                        else f"Hardware/alarm fault: env_fault={hw_fault}, sys={sys_alarms.strip()!r}, chas={chas_alarms.strip()!r}"
+                    )
                 )
             ),
         )
