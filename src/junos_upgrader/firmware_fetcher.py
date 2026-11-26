@@ -438,7 +438,17 @@ def scan_and_ingest_directory(
     update_manifest: bool = True,
 ) -> list[dict[str, str]]:
     """Inspect .tgz packages in scan_dir, place valid images into firmware_dir, and record MD5s."""
-    candidates = [p for p in scan_dir.rglob("*.tgz") if p.is_file() and "contents" not in p.parts]
+    resolved_scan = scan_dir.resolve()
+    resolved_fw = firmware_dir.resolve()
+    skip_fw_dir = resolved_fw != resolved_scan and resolved_fw.is_relative_to(resolved_scan)
+
+    candidates = [
+        p
+        for p in scan_dir.rglob("*.tgz")
+        if p.is_file()
+        and "contents" not in p.parts
+        and not (skip_fw_dir and p.resolve().is_relative_to(resolved_fw))
+    ]
     candidates.sort(key=_candidate_sort_key)
 
     ingested: list[dict[str, str]] = []

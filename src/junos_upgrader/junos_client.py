@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -188,6 +189,13 @@ class NetmikoJunosTransport:
             NetmikoTimeoutException,
         )
         from paramiko import SSHException
+        from paramiko.ssh_exception import IncompatiblePeer
+
+        # Suppress Paramiko's background Transport thread tracebacks on stderr during
+        # subnet discovery / legacy handshake fallbacks; exceptions are still raised here.
+        paramiko_transport_logger = logging.getLogger("paramiko.transport")
+        if paramiko_transport_logger.level == logging.NOTSET:
+            paramiko_transport_logger.setLevel(logging.CRITICAL)
 
         if self._conn is not None:
             self.disconnect()
@@ -232,6 +240,9 @@ class NetmikoJunosTransport:
                 last_err = exc
                 continue
             except NetmikoTimeoutException:
+                raise
+            except IncompatiblePeer:
+                # KEX/host-key negotiation failed before auth; retrying other credentials won't help.
                 raise
             except SSHException as exc:
                 if cred.key_file and idx < len(self.credentials) - 1:

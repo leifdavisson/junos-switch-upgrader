@@ -314,7 +314,13 @@ def upgrade_single_switch(
                     local_file=local_pkg,
                     external_base_url=opts.firmware_base_url,
                 )
-                if chosen_mode == "http-stream":
+                pkg_mb = (local_pkg.stat().st_size / (1024 * 1024)) if local_pkg else 350.0
+                can_tmpfs = (
+                    opts.transfer_mode == "auto"
+                    and work_sw.tmpfs_free_mb is not None
+                    and work_sw.tmpfs_free_mb >= int(pkg_mb) + 64
+                )
+                if chosen_mode == "http-stream" and not can_tmpfs:
                     if local_pkg is None and not _is_usable_external_url(opts.firmware_base_url):
                         with _locked():
                             work_sw.state = SwitchState.FAILED
@@ -386,13 +392,15 @@ def upgrade_single_switch(
                 _persist()
                 return work_sw
 
-            # Check whether this hop was already staged cleanly onto /var/tmp
+            # Check whether this hop was already staged cleanly onto /var/tmp or /tmp (tmpfs)
             expected_remote = f"/var/tmp/{hop.package_filename}"  # nosec B108
+            expected_tmpfs = f"/tmp/{hop.package_filename}"  # nosec B108
             transfer: TransferOutcome | None = None
-            if work_sw.staged_package == expected_remote:
+            if work_sw.staged_package in (expected_remote, expected_tmpfs):
+                staged_path = work_sw.staged_package
                 ok_staged, _ = driver.verify_staged_checksum(
                     transport,
-                    expected_remote,
+                    staged_path,
                     hop.checksum_type,
                     hop.checksum,
                     allow_unverified_checksums=opts.allow_unverified_checksums,
@@ -400,10 +408,10 @@ def upgrade_single_switch(
                 if ok_staged:
                     transfer = TransferOutcome(
                         mode_used="pre-staged",
-                        software_add_target=expected_remote,
-                        uses_no_copy=False,
-                        remote_staged_path=expected_remote,
-                        details=f"Reused verified pre-staged {expected_remote}",
+                        software_add_target=staged_path,
+                        uses_no_copy=staged_path.startswith("/tmp/"),  # nosec B108
+                        remote_staged_path=staged_path,
+                        details=f"Reused verified pre-staged {staged_path}",
                     )
 
             if transfer is None:
@@ -417,7 +425,7 @@ def upgrade_single_switch(
                     external_base_url=opts.firmware_base_url,
                     transfer_mode=opts.transfer_mode,
                 )
-                if not transfer.uses_no_copy and transfer.remote_staged_path:
+                if transfer.remote_staged_path:
                     ok_chk, chk_msg = driver.verify_staged_checksum(
                         transport,
                         transfer.remote_staged_path,

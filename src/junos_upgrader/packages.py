@@ -31,6 +31,7 @@ _FILENAME_ARCH_PREFIXES: list[tuple[str, str]] = [
     ("jinstall-ex-4300", "powerpc"),
     ("jinstall-host-qfx-5e", "qfx-5e"),
     ("jinstall-host-qfx-5", "qfx-5"),
+    ("jinstall-host-ex-4600", "qfx-5"),
     ("jinstall-host-ex-4650", "ex-4650"),
     ("junos-arm-32", "arm-32"),
     ("junos-evo-install", "junos-evo"),
@@ -134,7 +135,7 @@ def _classify_arch(model_hint: str, pkg_hint: str) -> str:
         return "qfx-5e"
     if "ex4650" in model_hint or "ex-4650" in pkg_hint:
         return "ex-4650"
-    if "ex4600" in model_hint or "qfx-5" in pkg_hint:
+    if "ex4600" in model_hint or "qfx-5" in pkg_hint or "ex-4600" in pkg_hint:
         return "qfx-5"
     if "ex4300-48mp" in model_hint or "ex-4300mp" in pkg_hint or "4300mp" in pkg_hint:
         return "x86-64-vmhost"
@@ -292,7 +293,10 @@ def validate_package_match(
     is_tgz = pkg_lower.endswith(".tgz")
     is_usb_media = "install-media" in pkg_lower or pkg_lower.endswith((".img", ".img.gz"))
     fam_lower = policy.package_family.strip().lower()
-    prefix_ok = bool(fam_lower) and pkg_lower.startswith(fam_lower + "-")
+    allowed_families = [fam_lower]
+    if fam_lower == "jinstall-host-qfx-5" and "ex4600" in policy.model_pattern.lower():
+        allowed_families.append("jinstall-host-ex-4600")
+    prefix_ok = any(bool(f) and pkg_lower.startswith(f + "-") for f in allowed_families)
     family_passed = safe_name and is_tgz and not is_usb_media and prefix_ok
     results.append(
         CheckResult(

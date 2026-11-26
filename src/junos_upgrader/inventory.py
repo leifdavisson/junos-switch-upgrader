@@ -338,7 +338,10 @@ def _probe_single_switch(
         fallback="SITE",
     )
 
-    free_mb, _ = parse_junos_storage(stor_json)
+    free_mb, stor_mounts = parse_junos_storage(stor_json)
+    tmpfs_mb = stor_mounts.get("/.mount/tmp")
+    if tmpfs_mb is None:
+        tmpfs_mb = stor_mounts.get("/tmp")
     arch_source = ver_json if ver_json.strip().startswith("{") else (ver_txt or ver_json)
     arch = extract_switch_arch(arch_source)
     neighbors = _parse_lldp_json(lldp_json, stp_json)
@@ -359,6 +362,7 @@ def _probe_single_switch(
         management_method="SSH",
         kernel_arch=arch,
         free_storage_mb=free_mb,
+        tmpfs_free_mb=tmpfs_mb,
         state=SwitchState.READY,
         last_updated=now_iso,
         expected_neighbors=neighbors,

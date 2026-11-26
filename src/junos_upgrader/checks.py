@@ -101,7 +101,7 @@ _HW_ALARM_RE = re.compile(
     re.IGNORECASE,
 )
 _MAC_RE = re.compile(r"\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b", re.IGNORECASE)
-_POE_ROW_RE = re.compile(r"^\s*\d+\s+(\d+(?:\.\d+)?)\s*W\s+(\d+(?:\.\d+)?)\s*W", re.IGNORECASE)
+_POE_ROW_RE = re.compile(r"^\s*\d+\**\s+(\d+(?:\.\d+)?)\s*W\s+(\d+(?:\.\d+)?)\s*W", re.IGNORECASE)
 _WEAK_SSH_RE = re.compile(
     r"(cbc|hmac-sha1|ssh-dss|diffie-hellman-group1-sha1|protocol-version\s+v1)",
     re.IGNORECASE,
@@ -546,6 +546,7 @@ def auto_cleanup_storage(
     evidence_dir: Path,
     execute_cleanup: bool = True,
     preserve_paths: set[str] | None = None,
+    mounts_out: dict[str, int] | None = None,
 ) -> tuple[int | None, str]:
     """Audit /var/crash & /var/tmp, preview cleanup, and optionally execute safe cleanup."""
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -573,7 +574,9 @@ def auto_cleanup_storage(
     storage_json = transport.run_command("show system storage | display json")
     if not storage_json.strip().startswith("{"):
         storage_json = transport.run_command("show system storage")
-    free_mb, _ = parse_junos_storage(storage_json)
+    free_mb, parsed_mounts = parse_junos_storage(storage_json)
+    if mounts_out is not None:
+        mounts_out.update(parsed_mounts)
     return free_mb, dry_clean
 
 
@@ -598,13 +601,20 @@ def evaluate_hardware_and_fs_triage(
         staged_name = Path(switch.staged_package).name
         if not expected_hop_filename or staged_name == expected_hop_filename:
             preserve = {f"/var/tmp/{staged_name}"}  # nosec B108
+    parsed_mounts: dict[str, int] = {}
     free_mb, _ = auto_cleanup_storage(
         transport,
         evidence_dir,
         execute_cleanup=execute_cleanup,
         preserve_paths=preserve,
+        mounts_out=parsed_mounts,
     )
     switch.free_storage_mb = free_mb
+    tmpfs_mb = parsed_mounts.get("/.mount/tmp")
+    if tmpfs_mb is None:
+        tmpfs_mb = parsed_mounts.get("/tmp")
+    if tmpfs_mb is not None:
+        switch.tmpfs_free_mb = tmpfs_mb
 
     # 1. Read-only mount check (fail-closed if mount output is empty or permission-denied)
     mount_out = transport.run_command('start shell command "mount"')
@@ -642,7 +652,7 @@ def evaluate_hardware_and_fs_triage(
 
     # 2. Flash/MMC hardware I/O errors in syslog (ignore our own UI_CMDLINE audit echo)
     log_out = transport.run_command(
-        'show log messages | match "g_vfs_done|Input/output error|mmc[0-9]*:.*[Ee]rror|bad block|UNEXPECTED INCONSISTENCY" | except UI_CMDLINE | last 25'
+        'show log messages | match "g_vfs_done|Input/output error|mmc[0-9]*:.*[Ee]rror|bad block|UNEXPECTED INCONSISTENCY" | except UI_CMDLINE | last 25 | no-more'
     )
     (evidence_dir / "flash_log_scan.txt").write_text(log_out, encoding="utf-8")
     filtered_log = "\n".join(
@@ -692,15 +702,23 @@ def evaluate_hardware_and_fs_triage(
         and "/var partition usage is high" in sys_alarms
         and (free_mb is not None and free_mb >= policy.min_free_storage_mb)
     )
+    only_rescue_unset_alarm = (
+        alarm_bad
+        and not chas_non_var_alarm
+        and not hw_fault
+        and "1 alarms currently active" in sys_alarms
+        and "rescue configuration is not set" in sys_alarms.lower()
+    )
+    benign_minor_alarm = only_var_usage_alarm or only_rescue_unset_alarm
     checks.append(
         CheckResult(
             name="chassis_health",
-            passed=not (hw_fault or (alarm_bad and not only_var_usage_alarm)),
-            hard_stop=(hw_fault or (alarm_bad and not only_var_usage_alarm)),
+            passed=not (hw_fault or (alarm_bad and not benign_minor_alarm)),
+            hard_stop=(hw_fault or (alarm_bad and not benign_minor_alarm)),
             severity=(
                 "replace"
                 if hw_fault
-                else ("warn" if only_var_usage_alarm else ("fail" if alarm_bad else "info"))
+                else ("warn" if benign_minor_alarm else ("fail" if alarm_bad else "info"))
             ),
             message=(
                 "Chassis environment OK and zero active alarms."
@@ -708,7 +726,11 @@ def evaluate_hardware_and_fs_triage(
                 else (
                     "Minor storage usage alarm active (/var partition usage is high) — auto-cleanup enabled for install."
                     if only_var_usage_alarm
-                    else f"Hardware/alarm fault: env_fault={hw_fault}, sys={sys_alarms.strip()!r}, chas={chas_alarms.strip()!r}"
+                    else (
+                        "Minor system alarm active (Rescue configuration is not set) — will be saved during backup."
+                        if only_rescue_unset_alarm
+                        else f"Hardware/alarm fault: env_fault={hw_fault}, sys={sys_alarms.strip()!r}, chas={chas_alarms.strip()!r}"
+                    )
                 )
             ),
         )
@@ -757,22 +779,30 @@ def evaluate_hardware_and_fs_triage(
     if optics_bad:
         replace_triggers.append("Optics alarm on SFP/SFP+ link")
 
-    # 6. Storage floor
+    # 6. Storage floor (only quarantine as replace-recommended if cleanup was already attempted)
     storage_ok = free_mb is not None and free_mb >= policy.min_free_storage_mb
+    storage_quarantine = (not storage_ok) and execute_cleanup
     checks.append(
         CheckResult(
             name="storage_floor",
             passed=storage_ok,
-            severity="replace" if not storage_ok else "info",
+            severity="replace" if storage_quarantine else ("fail" if not storage_ok else "info"),
             message=(
                 f"Free storage {free_mb} MB >= {policy.min_free_storage_mb} MB floor."
                 if storage_ok
-                else f"Storage {free_mb} MB below minimum {policy.min_free_storage_mb} MB floor."
+                else (
+                    f"Storage {free_mb} MB below minimum {policy.min_free_storage_mb} MB floor."
+                    if execute_cleanup
+                    else (
+                        f"Storage {free_mb} MB below minimum {policy.min_free_storage_mb} MB floor "
+                        "(read-only precheck: run `stage`/`upgrade` with --auto-cleanup or free space first)."
+                    )
+                )
             ),
             details={"free_mb": free_mb, "min_mb": policy.min_free_storage_mb},
         )
     )
-    if not storage_ok:
+    if storage_quarantine:
         replace_triggers.append(
             f"Insufficient storage ({free_mb} MB < {policy.min_free_storage_mb} MB)"
         )
@@ -813,16 +843,24 @@ def evaluate_hardware_and_fs_triage(
         switch.state = SwitchState.REPLACE_RECOMMENDED
         return TriageVerdict.REPLACE_RECOMMENDED, checks
 
-    if alarm_bad or mount_cmd_err:
+    if alarm_bad or mount_cmd_err or not storage_ok:
         switch.triage_verdict = TriageVerdict.NEEDS_REMEDIATION.value
         reasons: list[str] = []
         if mount_cmd_err:
             reasons.append("Unable to inspect flash mount state (shell mount error)")
+        if not storage_ok:
+            reasons.append(
+                f"Storage {free_mb} MB below {policy.min_free_storage_mb} MB floor (cleanup not yet executed)"
+            )
         if alarm_bad:
             reasons.append(
                 "Minor /var partition usage alarm (auto-cleanup recommended)"
                 if only_var_usage_alarm
-                else "Active system/chassis alarm"
+                else (
+                    "Minor Rescue configuration is not set alarm (saved during backup)"
+                    if only_rescue_unset_alarm
+                    else "Active system/chassis alarm"
+                )
             )
         switch.triage_reasons = reasons
         return TriageVerdict.NEEDS_REMEDIATION, checks

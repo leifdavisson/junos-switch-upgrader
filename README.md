@@ -129,6 +129,7 @@ junos-upgrader upgrade --credentials-file credentials.json \
 | `init-from-crawler <dir>` | Import `net-docu-crawler` `asset_inventory.csv` and `neighbors.csv` into a site manifest |
 | `discover` | Live SSH discovery from IPs, hostnames, CIDRs, or `--targets-file` |
 | `status` | Display current inventory table, depth, triage verdict, and FSM state |
+| `reset-state` | Reset `failed`, `replace-recommended`, `ancestor-hold`, or `staged` switches back to `ready` and refresh hop plan |
 | `plan` | Show per-switch remaining multi-hop upgrade path |
 | `topology` | Render Rich tree, leaf-first waves, Mermaid `--markdown`, or loopback `--serve` dashboard (`--redact`, `--write-manifest`) |
 | `firmware shopping-list` | Deduplicated table of required firmware packages across eligible switches |

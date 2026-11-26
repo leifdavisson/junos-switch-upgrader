@@ -515,7 +515,21 @@ def stage_or_stream_package(
     if local_url:
         validate_cli_target(local_url, "firmware URL")
 
-    if chosen == "http-stream":
+    pkg_mb = (local_file.stat().st_size / (1024 * 1024)) if local_file else 350.0
+    use_tmpfs = (
+        transfer_mode == "auto"
+        and switch.tmpfs_free_mb is not None
+        and switch.tmpfs_free_mb >= int(pkg_mb) + 64
+        and (
+            chosen == "http-stream"
+            or (
+                switch.free_storage_mb is not None
+                and switch.free_storage_mb < max(int(pkg_mb * 2.5), 750)
+            )
+        )
+    )
+
+    if chosen == "http-stream" and not use_tmpfs:
         if not local_url:
             raise RuntimeError(
                 f"HTTP streaming for {safe_filename} requires an active UnifiedFirmwareServer "
@@ -528,11 +542,12 @@ def stage_or_stream_package(
             details=f"Streaming directly via HTTP (`no-copy unlink`) from {local_url}",
         )
 
+    stage_dir = "/tmp" if use_tmpfs else "/var/tmp"  # nosec B108
     remote_pkg = validate_cli_target(
-        f"/var/tmp/{safe_filename}",  # nosec B108
+        f"{stage_dir}/{safe_filename}",
         "remote package path",
     )
-    if local_url and chosen in ("http", "external-http", "http-with-scp-fallback"):
+    if local_url and (use_tmpfs or chosen in ("http", "external-http", "http-with-scp-fallback")):
         http_err = ""
         try:
             copy_out = transport.run_command(
@@ -540,11 +555,15 @@ def stage_or_stream_package(
             )
             if not _http_copy_failed(copy_out):
                 return TransferOutcome(
-                    mode_used="http-copy",
+                    mode_used="http-tmpfs" if use_tmpfs else "http-copy",
                     software_add_target=remote_pkg,
-                    uses_no_copy=False,
+                    uses_no_copy=use_tmpfs,
                     remote_staged_path=remote_pkg,
-                    details=f"Copied via HTTP to {remote_pkg}",
+                    details=(
+                        f"Copied via HTTP to tmpfs {remote_pkg} (`no-copy unlink`)"
+                        if use_tmpfs
+                        else f"Copied via HTTP to {remote_pkg}"
+                    ),
                 )
             http_err = copy_out.strip() or "empty response"
         except Exception as exc:  # noqa: BLE001
@@ -569,9 +588,13 @@ def stage_or_stream_package(
         _cleanup_remote_partial(transport, remote_pkg)
         raise
     return TransferOutcome(
-        mode_used="scp",
+        mode_used="scp-tmpfs" if use_tmpfs else "scp",
         software_add_target=remote_pkg,
-        uses_no_copy=False,
+        uses_no_copy=use_tmpfs,
         remote_staged_path=remote_pkg,
-        details=f"Pushed via direct SCP from {local_file} to {remote_pkg}",
+        details=(
+            f"Pushed via direct SCP to tmpfs {remote_pkg} (`no-copy unlink`)"
+            if use_tmpfs
+            else f"Pushed via direct SCP from {local_file} to {remote_pkg}"
+        ),
     )

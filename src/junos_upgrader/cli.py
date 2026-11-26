@@ -7,6 +7,7 @@ import contextlib
 import importlib.resources
 import ipaddress
 import json
+import logging
 import threading
 import time
 import urllib.error
@@ -263,8 +264,34 @@ def _warn_if_bleeding_edge(
 
 @click.group()
 @click.version_option(version=__version__)
-def main() -> None:
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose DEBUG logging for SSH, discovery, and transfer diagnostics",
+)
+@click.option(
+    "--log-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write structured diagnostic logs to a file",
+)
+def main(verbose: bool = False, log_file: Path | None = None) -> None:
     """Site-generic, topology-aware Juniper EX/QFX firmware upgrade orchestrator."""
+    if verbose or log_file is not None:
+        level = logging.DEBUG if verbose else logging.INFO
+        handlers: list[logging.Handler] = []
+        if verbose:
+            handlers.append(logging.StreamHandler())
+        if log_file is not None:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            handlers=handlers,
+            force=True,
+        )
 
 
 @main.command("init-repo")
@@ -536,6 +563,11 @@ def shopping_list_cmd(manifest: Path, releases: Path | None, firmware_dir: Path)
             rich_escape(it.portal_url),
         )
     console.print(table)
+    console.print(
+        "[dim]Portal tip: select OS = 'Junos SR' (or 'Junos') -> 'Install Package' (.tgz). "
+        "Do NOT download 'Install Media' (.gz USB images) or 'J-Web'. "
+        "If an older train is pruned from the portal, open a JTAC case for archived .tgz links.[/dim]"
+    )
 
 
 @firmware_group.command("scan")
@@ -724,6 +756,77 @@ def status_cmd(manifest: Path, site: str | None, model: str | None) -> None:
             rich_escape(sw.state.value),
         )
     console.print(table)
+
+
+@main.command("reset-state")
+@click.option(
+    "--manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=DEFAULT_MANIFEST,
+)
+@click.option(
+    "--releases",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.option("--site", default=None)
+@click.option("--model", default=None)
+@click.option(
+    "--host",
+    "--hosts",
+    "hosts",
+    multiple=True,
+    help="Target hostname or IP (repeatable or comma-separated)",
+)
+def reset_state_cmd(
+    manifest: Path,
+    releases: Path | None,
+    site: str | None,
+    model: str | None,
+    hosts: tuple[str, ...],
+) -> None:
+    """Reset failed, quarantined (replace-recommended), or held switches back to ready."""
+    releases_path = _resolve_releases_arg(releases)
+    _, policies, exclusions = load_release_catalog(releases_path)
+    all_switches = _load_inventory_or_exit(manifest)
+    targets = _filter_switches(all_switches, site, model, hosts, include_excluded=True)
+    resettable = {
+        SwitchState.FAILED,
+        SwitchState.REPLACE_RECOMMENDED,
+        SwitchState.ANCESTOR_HOLD,
+        SwitchState.STAGED,
+        SwitchState.NOT_READY,
+    }
+    reset_count = 0
+    for sw in targets:
+        if sw.state not in resettable:
+            continue
+        prev = sw.state.value
+        sw.state = SwitchState.READY
+        sw.last_error = ""
+        sw.triage_verdict = ""
+        sw.triage_reasons = []
+        sw.staged_package = ""
+        sw.staged_checksum = ""
+        try:
+            refresh_switch_plan(sw, policies, exclusions)
+        except ValueError as exc:
+            sw.state = SwitchState.NOT_READY
+            sw.last_error = f"Unparseable current_version {sw.current_version!r}: {exc}"
+        reset_count += 1
+        console.print(
+            f"[green]Reset {rich_escape(sw.hostname)} ({rich_escape(prev)} -> {rich_escape(sw.state.value)}, "
+            f"next={rich_escape(sw.next_hop or 'current')})[/green]"
+        )
+    if reset_count == 0:
+        console.print(
+            "[yellow]No failed, quarantined, or held switches matched your filters.[/yellow]"
+        )
+        return
+    save_inventory(all_switches, manifest)
+    console.print(
+        f"[green]Saved {reset_count} reset switch(es) -> {rich_escape(str(manifest))}[/green]"
+    )
 
 
 @main.command("plan")

@@ -29,6 +29,7 @@ from junos_upgrader.firmware_fetcher import (
 from junos_upgrader.models import HopSpec, SwitchRecord, SwitchState
 from junos_upgrader.packages import (
     extract_switch_arch,
+    infer_arch_from_filename,
     inspect_local_tgz,
     validate_package_match,
 )
@@ -212,6 +213,22 @@ def test_validate_package_match_prefix_checksums_versions_and_unknowns(tmp_path:
     )
     res_5e = validate_package_match(sw4600, pol4600, hop_5e, local_file=None)
     assert not res_5e[0].passed and res_5e[0].severity == "fail"
+
+    # 1b. EX4600 native package prefix (jinstall-host-ex-4600-*) also matches ex4600* (qfx-5)
+    assert infer_arch_from_filename("jinstall-host-ex-4600-21.4R3-S12.5-signed.tgz") == "qfx-5"
+    res_4600_native = validate_package_match(
+        sw4600,
+        pol4600,
+        HopSpec(
+            "21.4R3-S12",
+            "21.4R3-S12.5",
+            "jinstall-host-ex-4600-21.4R3-S12.5-signed.tgz",
+            "md5",
+            "a" * 32,
+        ),
+        local_file=None,
+    )
+    assert all(r.passed for r in res_4600_native if r.hard_stop)
 
     # 2. install-media .tgz must fail with severity="fail" (not "info")
     sw3400 = _make_sw("IDF_3400", "ex3400-48p", "23.2R2-S3", arch="arm-32")
@@ -560,3 +577,27 @@ def test_interactive_portal_session_stability_and_missing_watch_dir(
     assert len(opened) == 1
     assert len(ingested) == 1
     assert ingested[0]["version"] == "23.4R2-S8"
+
+
+def test_scan_and_ingest_skips_nested_firmware_dir(tmp_path: Path) -> None:
+    rel = tmp_path / "approved-releases.yml"
+    rel.write_text(RELEASES_YML.read_text(encoding="utf-8"), encoding="utf-8")
+    _, policies, _ = load_release_catalog(rel)
+
+    downloads = tmp_path / "Downloads"
+    fw_dir = downloads / "repo" / "firmware"
+    existing_fw = fw_dir / "juniper" / "ex3400" / "23.4R2-S8" / "junos-arm-32-23.4R2-S8.tgz"
+    _make_tgz(existing_fw, comment="arm-32")
+
+    # Scanning Downloads MUST skip files already inside nested fw_dir
+    results_parent = scan_and_ingest_directory(
+        downloads, fw_dir, rel, policies, update_manifest=False
+    )
+    assert results_parent == []
+
+    # Scanning fw_dir directly still inspects it
+    results_direct = scan_and_ingest_directory(
+        fw_dir, fw_dir, rel, policies, update_manifest=False
+    )
+    assert len(results_direct) == 1
+    assert results_direct[0]["status"] == "ingested"

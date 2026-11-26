@@ -215,6 +215,7 @@ class SwitchRecord:
     triage_verdict: str = ""
     triage_reasons: list[str] = field(default_factory=list)
     free_storage_mb: int | None = None
+    tmpfs_free_mb: int | None = None
     recovery_snapshot: str = ""
     topology_depth: int = 0
     upstream_switch: str = ""
@@ -246,6 +247,10 @@ class SwitchRecord:
             isinstance(self.free_storage_mb, bool) or not isinstance(self.free_storage_mb, int)
         ):
             raise ValueError(f"free_storage_mb must be int or None, got {self.free_storage_mb!r}")
+        if self.tmpfs_free_mb is not None and (
+            isinstance(self.tmpfs_free_mb, bool) or not isinstance(self.tmpfs_free_mb, int)
+        ):
+            raise ValueError(f"tmpfs_free_mb must be int or None, got {self.tmpfs_free_mb!r}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize record to a JSON-compatible deep-copied dictionary."""
@@ -266,6 +271,7 @@ class SwitchRecord:
             "triage_verdict": self.triage_verdict,
             "triage_reasons": list(self.triage_reasons),
             "free_storage_mb": self.free_storage_mb,
+            "tmpfs_free_mb": self.tmpfs_free_mb,
             "recovery_snapshot": self.recovery_snapshot,
             "topology_depth": self.topology_depth,
             "upstream_switch": self.upstream_switch,
@@ -368,6 +374,7 @@ class SwitchRecord:
             triage_verdict=_opt_str(data, "triage_verdict"),
             triage_reasons=_opt_str_list(data, "triage_reasons"),
             free_storage_mb=_parse_optional_int(data.get("free_storage_mb"), "free_storage_mb"),
+            tmpfs_free_mb=_parse_optional_int(data.get("tmpfs_free_mb"), "tmpfs_free_mb"),
             recovery_snapshot=_opt_str(data, "recovery_snapshot"),
             topology_depth=depth,
             upstream_switch=_opt_str(data, "upstream_switch"),
