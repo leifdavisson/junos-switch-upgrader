@@ -192,8 +192,11 @@ class JunosSwitchDriver:
 
         try:
             clean_remote = validate_cli_target(remote_path, "remote_path")
-            if not clean_remote.startswith("/var/tmp/") or ".." in clean_remote:  # nosec B108
-                return False, f"Remote path must be a direct file under /var/tmp/: {remote_path!r}"
+            if not clean_remote.startswith(("/var/tmp/", "/tmp/")) or ".." in clean_remote:  # nosec B108
+                return (
+                    False,
+                    f"Remote path must be a direct file under /var/tmp/ or /tmp/: {remote_path!r}",
+                )
             validate_package_filename(Path(clean_remote).name)
         except ValueError as exc:
             return False, str(exc)
@@ -269,9 +272,18 @@ class JunosSwitchDriver:
             read_timeout=900,
         )
         lower_out = install_out.lower()
-        if not lower_out.strip():
-            return False, "Software add failed: empty response from switch."
-        if any(tok in lower_out for tok in _INSTALL_FAIL_TOKENS):
+        if not lower_out.strip() or any(tok in lower_out for tok in _INSTALL_FAIL_TOKENS):
+            if transfer.remote_staged_path and transfer.remote_staged_path.startswith(
+                ("/var/tmp/", "/tmp/")  # nosec B108
+            ):
+                try:
+                    transport.run_command(
+                        f"file delete {transfer.remote_staged_path}", read_timeout=30
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            if not lower_out.strip():
+                return False, "Software add failed: empty response from switch."
             return False, f"Software add failed: {install_out.strip()}"
 
         if hasattr(transport, "run_interactive_yes"):

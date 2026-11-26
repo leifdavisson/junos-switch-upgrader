@@ -498,3 +498,134 @@ def test_lldp_multi_re_json_and_var_storage_and_live_version_refresh(tmp_path: P
     assert res_done.state == SwitchState.COMPLETED
     assert res_done.current_version == "23.4R2-S8"
     assert "request system reboot" not in tr_done.commands_executed
+
+
+def test_norris_live_prep_fixes_poe_nomore_tmpfs_storage_and_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+    from conftest import create_valid_tgz
+
+    from junos_upgrader.checks import _extract_poe_watts
+    from junos_upgrader.cli import main
+    from junos_upgrader.drivers.junos import JunosSwitchDriver
+    from junos_upgrader.inventory import load_inventory, save_inventory
+    from junos_upgrader.transfer import (
+        TransferOutcome,
+        UnifiedFirmwareServer,
+        stage_or_stream_package,
+    )
+
+    # #11: _extract_poe_watts parses EX3400 controller rows with trailing asterisks ("0**")
+    poe_out = (
+        "Controller  Maximum   Power         Guard    Management   Status        Lldp\n"
+        "index       power     consumption   band                                Priority\n"
+        "   0**      740W      36.20W          0W     Class        AT_MODE       Disabled\n"
+        "  **New PoE software upgrade available.\n"
+    )
+    assert _extract_poe_watts(poe_out) == pytest.approx(36.20)
+
+    # #5 & #6: default boot_timeout_seconds >= 1200 and read-only precheck low storage != quarantine
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    assert pol.boot_timeout_seconds >= 1200
+
+    sw_low = _make_sw("LOW_STORAGE_SW", "ex3400-48p", "18.1R3-S4.2")
+    tr_low = FakeJunosTransport(
+        sw_low.hostname,
+        sw_low.model,
+        sw_low.serial_number,
+        sw_low.current_version,
+        free_storage_mb=100,
+    )
+    verdict_ro, _ = evaluate_hardware_and_fs_triage(
+        tr_low, sw_low, pol, tmp_path / "ev_ro", tmp_path / "cfg_ro", execute_cleanup=False
+    )
+    assert verdict_ro == TriageVerdict.NEEDS_REMEDIATION
+    assert sw_low.state == SwitchState.READY
+    # #12: flash_log_scan uses | no-more
+    assert any("show log messages" in cmd and "| no-more" in cmd for cmd in tr_low.commands_executed)
+
+    verdict_rw, _ = evaluate_hardware_and_fs_triage(
+        tr_low, sw_low, pol, tmp_path / "ev_rw", tmp_path / "cfg_rw", execute_cleanup=True
+    )
+    assert verdict_rw == TriageVerdict.REPLACE_RECOMMENDED
+    assert sw_low.state == SwitchState.REPLACE_RECOMMENDED
+
+    # #10: /tmp (tmpfs) staging when /.mount is tight and tmpfs has headroom + failed install cleanup
+    fw_dir = tmp_path / "fw"
+    hop = pol.hops[-1]
+    _, md5_hex, _ = create_valid_tgz(
+        fw_dir / "juniper" / "ex3400" / hop.train / hop.package_filename
+    )
+    hop.checksum = md5_hex
+
+    sw_tmp = _make_sw("TMPFS_SW", "ex3400-48p", "23.2R2-S3", ip="127.0.0.1")
+    sw_tmp.free_storage_mb = 437
+    sw_tmp.tmpfs_free_mb = 904
+    tr_tmp = FakeJunosTransport(
+        sw_tmp.hostname,
+        sw_tmp.model,
+        sw_tmp.serial_number,
+        sw_tmp.current_version,
+        checksums_by_filename={hop.package_filename: md5_hex},
+    )
+    with UnifiedFirmwareServer(firmware_dir=fw_dir, port=0, bind_host="127.0.0.1") as srv:
+        outcome = stage_or_stream_package(
+            tr_tmp, sw_tmp, pol, hop, fw_dir, srv, "", transfer_mode="auto"
+        )
+    assert outcome.mode_used == "http-tmpfs"
+    assert outcome.remote_staged_path == f"/tmp/{hop.package_filename}"
+    assert outcome.uses_no_copy is True
+
+    drv = JunosSwitchDriver()
+    ok_chk, _ = drv.verify_staged_checksum(tr_tmp, outcome.remote_staged_path, "md5", md5_hex)
+    assert ok_chk is True
+
+    # Failed software add cleans up stranded /tmp/<pkg>.tgz
+    tr_fail = FakeJunosTransport(
+        sw_tmp.hostname,
+        sw_tmp.model,
+        sw_tmp.serial_number,
+        sw_tmp.current_version,
+        fail_install=True,
+    )
+    ok_inst, _ = drv.install_and_reboot(
+        tr_fail,
+        hop,
+        TransferOutcome(
+            mode_used="http-tmpfs",
+            software_add_target=f"/tmp/{hop.package_filename}",
+            uses_no_copy=True,
+            remote_staged_path=f"/tmp/{hop.package_filename}",
+        ),
+    )
+    assert ok_inst is False
+    assert f"file delete /tmp/{hop.package_filename}" in tr_fail.commands_executed
+
+    # #7 & #8: CLI --verbose/--log-file and reset-state
+    manifest_path = tmp_path / "site-inventory.json"
+    sw_q = _make_sw("QUAR_SW", "ex3400-48p", "23.2R2-S3")
+    sw_q.state = SwitchState.REPLACE_RECOMMENDED
+    sw_q.last_error = "Storage 428 MB below minimum 600 MB floor."
+    save_inventory([sw_q], manifest_path)
+
+    log_file = tmp_path / "run.log"
+    runner = CliRunner()
+    res_cli = runner.invoke(
+        main,
+        [
+            "--verbose",
+            "--log-file",
+            str(log_file),
+            "reset-state",
+            "--manifest",
+            str(manifest_path),
+            "--releases",
+            str(RELEASES_YML),
+        ],
+    )
+    assert res_cli.exit_code == 0, res_cli.output
+    assert log_file.exists()
+    reloaded = load_inventory(manifest_path)
+    assert reloaded[0].state == SwitchState.READY
+    assert reloaded[0].last_error == ""
