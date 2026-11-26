@@ -688,6 +688,25 @@ def test_netmiko_connect_lifecycle_no_timeout_doubling_and_cleanup() -> None:
     with pytest.raises(RuntimeError):
         detect_outbound_ip("nonexistent.invalid", allow_loopback_fallback=False)
 
+    # 6. IncompatiblePeer tries legacy fallback once, then stops without looping over credentials
+    import logging
+
+    from paramiko.ssh_exception import IncompatiblePeer
+
+    logging.getLogger("paramiko.transport").setLevel(logging.NOTSET)
+    tr_inc = NetmikoJunosTransport(host="192.0.2.10", credentials=[c1, c2])
+    with patch(
+        "netmiko.ConnectHandler",
+        side_effect=[
+            IncompatiblePeer("no acceptable host key"),
+            IncompatiblePeer("no acceptable kex algorithm"),
+        ],
+    ) as mock_ch:
+        with pytest.raises(IncompatiblePeer):
+            tr_inc.connect()
+        assert mock_ch.call_count == 2
+    assert logging.getLogger("paramiko.transport").level == logging.CRITICAL
+
 
 # ---------------------------------------------------------------------------
 # drivers/junos.py tests
