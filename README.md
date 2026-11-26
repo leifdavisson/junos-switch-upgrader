@@ -6,6 +6,10 @@ Site-generic, topology-aware Juniper Networks (`EX2300`, `EX3400`, `EX4100`, `EX
 
 Licensed under **GNU AGPLv3** (`AGPL-3.0-or-later`). See [LICENSE](LICENSE).
 
+## Documentation
+
+- **[Operator Guide (Walkthrough & Common Scenarios)](docs/OPERATOR_GUIDE.md)** — Beginner-friendly step-by-step guide covering the 5-step upgrade workflow, safe password handling (`JUNOS_PASSWORD` / `read -s` / `credentials.json`), EX2300/EX3400 flash & `tmpfs` handling, `precheck --fix`, `--create-fallback-user`, and a flag cheat-sheet.
+
 ## Architecture & Control Flow
 
 ```mermaid
