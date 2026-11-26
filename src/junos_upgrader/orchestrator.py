@@ -10,7 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from junos_upgrader.checks import safe_subpath, sanitize_path_segment
 from junos_upgrader.drivers import get_driver
@@ -31,9 +31,12 @@ from junos_upgrader.topology import (
 from junos_upgrader.transfer import (
     TransferOutcome,
     UnifiedFirmwareServer,
+    _cleanup_remote_partial,
     _is_usable_external_url,
     resolve_local_firmware_file,
     resolve_transfer_mode,
+    validate_cli_target,
+    validate_package_filename,
 )
 
 
@@ -65,11 +68,33 @@ class UpgradeOptions:
     refresh_snapshot: bool = False
     accept_bleeding_edge: bool = False
     allow_unverified_checksums: bool = False
+    allow_aaa_only_ssh: bool = False
     dry_run: bool = False
     state_lock: threading.Lock | None = None
 
 
 TransportFactory = Callable[[SwitchRecord], SwitchTransport]
+
+
+def _cleanup_remote_staged(transport: SwitchTransport, remote_path: str) -> None:
+    """Best-effort delete a staged firmware archive under /var/tmp/ or /tmp/."""
+    if (
+        not remote_path
+        or not remote_path.startswith(("/var/tmp/", "/tmp/"))  # nosec B108
+        or ".." in remote_path
+    ):
+        return
+    try:
+        clean_remote = validate_cli_target(remote_path, "remote_staged_path")
+        posix = PurePosixPath(clean_remote)
+        if posix.parent.as_posix() not in ("/tmp", "/var/tmp"):  # nosec B108
+            return
+        if clean_remote != f"{posix.parent.as_posix()}/{posix.name}":
+            return
+        validate_package_filename(posix.name)
+    except ValueError:
+        return
+    _cleanup_remote_partial(transport, clean_remote)
 
 
 def _wait_for_reboot(
@@ -237,6 +262,7 @@ def upgrade_single_switch(
                 ignore_old_cores=opts.ignore_old_cores,
                 allow_no_console=opts.allow_no_console,
                 allow_unverified_checksums=opts.allow_unverified_checksums,
+                allow_aaa_only_ssh=opts.allow_aaa_only_ssh,
             )
             failed_pre = [c for c in pre_checks if not c.passed and c.hard_stop]
             hop_specific_checks = frozenset(
@@ -307,6 +333,28 @@ def upgrade_single_switch(
 
             # Two-phase business-hours staging mode
             if opts.stage_only:
+                expected_remote = f"/var/tmp/{hop.package_filename}"  # nosec B108
+                expected_tmpfs = f"/tmp/{hop.package_filename}"  # nosec B108
+                if work_sw.staged_package in (expected_remote, expected_tmpfs):
+                    staged_path = work_sw.staged_package
+                    ok_existing, _ = driver.verify_staged_checksum(
+                        transport,
+                        staged_path,
+                        hop.checksum_type,
+                        hop.checksum,
+                        allow_unverified_checksums=opts.allow_unverified_checksums,
+                    )
+                    if ok_existing:
+                        with _locked():
+                            work_sw.state = SwitchState.STAGED
+                            work_sw.last_error = ""
+                        _persist()
+                        return work_sw
+                    _cleanup_remote_staged(transport, staged_path)
+                    with _locked():
+                        work_sw.staged_package = ""
+                        work_sw.staged_checksum = ""
+
                 chosen_mode = resolve_transfer_mode(
                     transfer_mode=opts.transfer_mode,
                     policy=policy,
@@ -339,22 +387,6 @@ def upgrade_single_switch(
                     _persist()
                     return work_sw
 
-                expected_remote = f"/var/tmp/{hop.package_filename}"  # nosec B108
-                if work_sw.staged_package == expected_remote:
-                    ok_existing, _ = driver.verify_staged_checksum(
-                        transport,
-                        expected_remote,
-                        hop.checksum_type,
-                        hop.checksum,
-                        allow_unverified_checksums=opts.allow_unverified_checksums,
-                    )
-                    if ok_existing:
-                        with _locked():
-                            work_sw.state = SwitchState.STAGED
-                            work_sw.last_error = ""
-                        _persist()
-                        return work_sw
-
                 transfer = driver.stage_package(
                     transport=transport,
                     switch=work_sw,
@@ -374,7 +406,10 @@ def upgrade_single_switch(
                         allow_unverified_checksums=opts.allow_unverified_checksums,
                     )
                     if not ok_chk:
+                        _cleanup_remote_staged(transport, transfer.remote_staged_path)
                         with _locked():
+                            work_sw.staged_package = ""
+                            work_sw.staged_checksum = ""
                             work_sw.state = SwitchState.FAILED
                             work_sw.last_error = chk_msg
                         _persist()
@@ -413,6 +448,11 @@ def upgrade_single_switch(
                         remote_staged_path=staged_path,
                         details=f"Reused verified pre-staged {staged_path}",
                     )
+                else:
+                    _cleanup_remote_staged(transport, staged_path)
+                    with _locked():
+                        work_sw.staged_package = ""
+                        work_sw.staged_checksum = ""
 
             if transfer is None:
                 transfer = driver.stage_package(
@@ -434,7 +474,10 @@ def upgrade_single_switch(
                         allow_unverified_checksums=opts.allow_unverified_checksums,
                     )
                     if not ok_chk:
+                        _cleanup_remote_staged(transport, transfer.remote_staged_path)
                         with _locked():
+                            work_sw.staged_package = ""
+                            work_sw.staged_checksum = ""
                             work_sw.state = SwitchState.FAILED
                             work_sw.last_error = chk_msg
                         _persist()

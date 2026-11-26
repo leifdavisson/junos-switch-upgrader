@@ -12,12 +12,12 @@ Licensed under **GNU AGPLv3** (`AGPL-3.0-or-later`). See [LICENSE](LICENSE).
 flowchart TD
     A["Live SSH Discovery (`discover` IP/CIDR/file) or Crawler Import"] --> B["Build Origin-Anchored Dependency Topology (Runner -> Gateway -> Transit -> Leaf)"]
     B --> C["Package Match & Firmware Portal Tools (`shopping-list` / `scan` / `pull` / `login` / `create-latest`)"]
-    C --> D["Pre-Flight Triage (RO Mount, Flash Errors, Env Alarms, Crash Dumps, Optics, Storage)"]
+    C --> D["Pre-Flight Triage (`precheck` Read-Only or `--fix` Remediation)"]
     D -- "Hardware/FS Fault" --> E["QUARANTINE: `replace-recommended` + Emergency Config Backup"]
     D -- "Healthy" --> F["Auto Storage Cleanup (`storage cleanup` + stale `/var/tmp/*.tgz`)"]
     F --> G["Leaf-First Wave Scheduler (Deepest Leaves First, Branch-Disjoint Batches)"]
     G --> H{"Transfer Mode (Unified `firmware/` Folder)"}
-    H -- "Low Flash (EX2300 `/.mount`)" --> I["HTTP Stream (`software add http://... no-copy unlink`)"]
+    H -- "Tight `/.mount` + `/.mount/tmp` Headroom" --> I["HTTP/`scp` -> `/tmp` (`tmpfs`) or HTTP Stream (`no-copy unlink`)"]
     H -- "Ample Flash" --> J["HTTP Copy -> `/var/tmp` (Auto SCP Fallback) + Checksum"]
     I & J --> K["Install + Reboot + Fixed Failure Timer + Post-Check Diff"]
     K -- Fail --> L["Hold Upstream Ancestors (`ancestor-hold`) & Stop Wave"]
@@ -29,10 +29,11 @@ flowchart TD
 ## Key Features
 
 - **Site-Generic Live Discovery (`discover`)**: Probe any IP, hostname, CIDR subnet, or host list over SSH (`--credentials-file` supports [net-docu-crawler](https://github.com/leifdavisson/net-docu-crawler) JSON credential lists; see [credentials.example.json](credentials.example.json)) to auto-detect model, serial, running Junos version, kernel architecture, `/.mount` free flash, LLDP neighbors, and STP Root Ports.
-- **Unified Single-Folder HTTP + SCP Server**: Serves `firmware/` over HTTP (using per-session URL tokens) for `EX2300` `no-copy unlink` streaming and fast `/var/tmp` pulls, seamlessly falling back to direct SCP push from the **exact same folder** if switch-to-runner HTTP is firewalled—while hosting the live dark-mode SVG topology dashboard on loopback `/`.
+- **Unified Single-Folder HTTP + SCP Server**: Serves `firmware/` over HTTP (using per-session URL tokens) for `EX2300` `no-copy unlink` streaming, `/tmp` (`/.mount/tmp` `tmpfs`) staging (`http-tmpfs` / `scp-tmpfs` with `no-copy unlink` when `/.mount` is tight and `tmpfs` has headroom), and `/var/tmp` pulls with automatic direct SCP fallback—while hosting the live dark-mode SVG topology dashboard on loopback `/`.
 - **Daisy-Chain Protection**: Orders upgrades strictly **leaf-first** (`Depth N` -> `Depth N-1`), isolates `Core` switches behind `--include-cores`, prevents pairing upstream/downstream switches in the same batch, and automatically marks upstream ancestors `ancestor-hold` if a downstream device fails.
 - **4-Way Switch-to-Package Validation**: Distinguishes multi-gig `-MP` VMHost images (`ex4300-48mp` vs `ex4300` PowerPC), ARM-32 (`ex2300`/`ex3400`), ARM-64 (`ex4100`), x86-64 (`ex4400`), and `Junos OS Evolved` vs classical `jinstall-host` before any file is transferred. Placeholder checksums hard-stop by default unless real hashes are populated (e.g., via `firmware scan`) or `--allow-unverified-checksums` is explicitly supplied.
-- **Replace-vs-Upgrade Triage Floor**: Detects read-only mounts, flash/MMC syslog I/O errors, fan/thermal/PSU faults, `/var/crash` core dumps, active uplink optical power alarms, and unrecoverable storage exhaustion—quarantining unsafe hardware (`replace-recommended`) and immediately exporting emergency backups.
+- **Replace-vs-Upgrade Triage & Safe `precheck --fix`**: Detects read-only mounts, flash/MMC syslog I/O errors, fan/thermal/PSU faults, `/var/crash` core dumps, active uplink optical power alarms, and unrecoverable storage exhaustion—quarantining unsafe hardware (`replace-recommended`) and immediately exporting emergency backups. `precheck` stays strictly read-only by default; opt-in `precheck --fix` runs safe non-rebooting remediations (saving unset rescue config, cleaning storage, purging stale `/var/tmp/*.tgz` while preserving active `/var/tmp` or `/tmp` staged images, and optional `--purge-previous-pkg` on EX2300/EX3400) and re-evaluates triage in-place.
+- **AAA-Only SSH Lockout Gate**: Scans `show configuration | display set` for RADIUS/TACACS+ `authentication-order` without an active local `super-user` fallback password/SSH key (or `ssh root-login allow`) and hard-stops `precheck`, `stage`, and `upgrade` unless `--allow-aaa-only-ssh` is explicitly supplied.
 - **3-Layer Pluggable Core (`drivers/` + FSM + Topology Scheduler)**: Separates the vendor-neutral [SwitchDriver](src/junos_upgrader/drivers/base.py) protocol ([JunosSwitchDriver](src/junos_upgrader/drivers/junos.py)) from the thread-safe persisted finite state machine (`ready` → `staged` → `downloaded` → `installing` → `rebooting` → `validated` → `completed`).
 - **Two-Phase Staging & Fast Intermediate Hops**: Run `junos-upgrader stage` during business hours to copy and verify `/var/tmp` packages without rebooting; during `upgrade`, pre-staged packages are reused without re-transferring, intermediate hops run fast 11-command delta checks (full 28-command baselines on Hop 1 Pre & Final Post), and a configurable `--post-settle-seconds` (default `60s`) verifies PoE power delivery, MAC repopulation, and LACP bundles post-reboot.
 - **Recovery Cheat-Sheets & Console Gate**: After passing prechecks, `precheck`, `stage`, and `upgrade` generate `deliverables/configs/<site>/<hostname>/recovery.txt` with exact management IP, netmask, gateway, OAM snapshot version, and loader/USB recovery commands (skipped if identity/precheck fails before baseline capture); `Core` switches require a `console_port` unless `--allow-no-console` is explicitly supplied.
@@ -84,42 +85,47 @@ pip install -e ".[dev]"
 cp credentials.example.json credentials.json
 # Edit credentials.json with real SSH credentials (never leave "CHANGE_ME")
 
-# 0. Optional: scaffold firmware directory layout or import from net-docu-crawler
-junos-upgrader init-repo .
-# junos-upgrader init-from-crawler /path/to/crawler_deliverables
-
 # 1. Discover switches live via SSH (RFC 5737 documentation IP example)
+#    (Optional first-time setup: `junos-upgrader init-repo .` or `init-from-crawler <dir>`)
 junos-upgrader discover --target 192.0.2.10 --credentials-file credentials.json
 
-# 2. Inspect inventory status, multi-hop plan, and dependency topology
-junos-upgrader status
-junos-upgrader plan
-junos-upgrader topology --markdown deliverables/topology.md
-junos-upgrader topology --serve --port 8080          # binds 127.0.0.1 by default
-
-# 3. Generate firmware shopping list & ingest downloaded .tgz packages (populates real MD5s)
+# 2. Scan & ingest downloaded .tgz packages (populates real MD5s; check `status` / `plan` / `topology`)
 junos-upgrader firmware shopping-list
 junos-upgrader firmware scan ~/Downloads --firmware-dir firmware
-# Also available: `firmware login`, `firmware pull --url <https-url>`, `firmware create-latest`
 
-# 4. Run live read-only precheck, landmine scan, triage & recovery.txt export
+# 3. Run live read-only precheck, or opt-in safe remediation with `--fix`
 junos-upgrader precheck --credentials-file credentials.json --skip-release-notes-gate
+# Safe non-rebooting fixes (save rescue config, storage cleanup, stale /var/tmp/*.tgz purge):
+junos-upgrader precheck --credentials-file credentials.json --skip-release-notes-gate --fix
+# If EX2300/EX3400 `/.mount` stays below floor after cleanup (removes rollback capability!):
+#   junos-upgrader precheck --credentials-file credentials.json --skip-release-notes-gate --fix --purge-previous-pkg
+# If switches use RADIUS/TACACS+ without a local super-user SSH fallback (explicit operator override):
+#   junos-upgrader precheck --credentials-file credentials.json --skip-release-notes-gate --allow-aaa-only-ssh
 
-# 5. Optional two-phase business-hours staging (copies & checksums without reboot)
+# 4. Business-hours staging (copies to /var/tmp or /tmp tmpfs & verifies checksum without reboot)
 junos-upgrader stage --credentials-file credentials.json --skip-release-notes-gate
 
-# 6. Run live SSH dry-run (triage, cleanup preview & config backup; stops before install/reboot)
+# 5. Live SSH dry-run (triage, cleanup preview & config backup; stops before install/reboot)
 junos-upgrader upgrade --credentials-file credentials.json \
   --change-number CHG001 --operator netops --skip-release-notes-gate --dry-run
 
-# 7. Before maintenance-window upgrade:
-#    - Populate real package checksums via `firmware scan` (or explicitly pass `--allow-unverified-checksums` only in a lab).
-#    - Review Juniper release notes for each hop and set `release_notes_reviewed: true` in manifests/approved-releases.yml
-#      (or pass `--skip-release-notes-gate` after manual review).
-#    - For non-JTAC manifests built with `firmware create-latest`, also pass `--accept-bleeding-edge`.
+# 6. Maintenance-window upgrade (ensure real checksums via `firmware scan` and reviewed release notes;
+#    pass `--accept-bleeding-edge` for non-JTAC manifests, `--allow-aaa-only-ssh` if overriding AAA gate)
 junos-upgrader upgrade --credentials-file credentials.json \
   --change-number CHG001 --operator netops --refresh-snapshot
 ```
+
+### Storage Constraints, `/tmp` (`tmpfs`) Staging & Remediation Notes
+
+- **Read-only vs `--fix` precheck**: `precheck` is strictly read-only by default. Passing `--fix` executes safe, non-rebooting remediations—saving missing rescue configuration (`request system configuration rescue save`), deleting stale `/var/tmp/*.tgz` files (while preserving any active `/var/tmp/<pkg>.tgz` or `/tmp/<pkg>.tgz` staged image), and running `request system storage cleanup no-confirm`—then re-evaluates triage in-place (`execute_cleanup=False`) without quarantining low-storage switches.
+- **`/tmp` (`/.mount/tmp` `tmpfs`) Staging**: On EX2300/EX3400 switches where `/.mount` is below the `/var/tmp` floor but `/.mount/tmp` (`tmpfs`) has sufficient headroom, `stage` and `upgrade` automatically select `http-tmpfs` or `scp-tmpfs` with `request system software add ... no-copy unlink`.
+- **EX2300/EX3400 Low-Flash Fallback (`--purge-previous-pkg`)**: When both `/.mount` and `/tmp` (`tmpfs`) are constrained and standard cleanup still leaves `/.mount` below floor, pass `precheck --fix --purge-previous-pkg` (or run the manual shell commands below on the switch) to delete the previous Junos package set and reclaim flash space. **Warning:** this removes on-box rollback to the prior Junos version—ensure a valid recovery sheet (`recovery.txt`) and backup exist first.
+  ```text
+  start shell
+  pkg setop rm previous
+  pkg delete old
+  ```
+- **AAA-Only SSH Lockout Gate (`--allow-aaa-only-ssh`)**: `precheck`, `stage`, and `upgrade` block switches configured with `authentication-order` `radius`/`tacplus` that lack an active local `super-user` password/SSH key or `ssh root-login allow`. Pass `--allow-aaa-only-ssh` only after verifying out-of-band console or AAA reachability.
 
 ## CLI Command Reference
 
@@ -137,9 +143,9 @@ junos-upgrader upgrade --credentials-file credentials.json \
 | `firmware pull` | Download signed HTTPS firmware URLs, validate, and ingest |
 | `firmware login` | Open Juniper Support Portal in browser and watch `--watch-dir` for downloads |
 | `firmware create-latest` | Build a separate non-JTAC bleeding-edge release manifest from newer local `.tgz` images |
-| `precheck` | Live read-only health/FS triage, landmine scan, config backup, and `recovery.txt` export |
-| `stage` | Two-phase business-hours staging (transfer & verify checksum without reboot) |
-| `upgrade` | Leaf-first multi-hop upgrade orchestration with reboot polling, post-checks, and ancestor holds |
+| `precheck` | Live health/FS triage, landmine scan, AAA gate (`--allow-aaa-only-ssh`), config backup, and `recovery.txt` export (read-only by default; `--fix` and `--purge-previous-pkg` for safe remediation) |
+| `stage` | Two-phase business-hours staging (`/var/tmp` or `/tmp` `tmpfs` transfer & checksum verify without reboot; supports `--allow-aaa-only-ssh`) |
+| `upgrade` | Leaf-first multi-hop upgrade orchestration with reboot polling, post-checks, ancestor holds, `--dry-run`, and `--allow-aaa-only-ssh` |
 
 ## Dependencies & Attribution
 

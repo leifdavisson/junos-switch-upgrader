@@ -7,6 +7,7 @@ import difflib
 import ipaddress
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,18 @@ _CLI_ERROR_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _PATH_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+TRIAGE_CHECKS = frozenset(
+    {
+        "fs_read_write",
+        "fs_flash_errors",
+        "chassis_health",
+        "no_crash_dumps",
+        "uplink_optics_health",
+        "storage_floor",
+        "recovery_snapshot",
+    }
+)
 
 
 def sanitize_path_segment(value: str, fallback: str = "unknown") -> str:
@@ -610,10 +623,10 @@ def evaluate_hardware_and_fs_triage(
         mounts_out=parsed_mounts,
     )
     switch.free_storage_mb = free_mb
-    tmpfs_mb = parsed_mounts.get("/.mount/tmp")
-    if tmpfs_mb is None:
-        tmpfs_mb = parsed_mounts.get("/tmp")
-    if tmpfs_mb is not None:
+    if parsed_mounts:
+        tmpfs_mb = parsed_mounts.get("/.mount/tmp")
+        if tmpfs_mb is None:
+            tmpfs_mb = parsed_mounts.get("/tmp")
         switch.tmpfs_free_mb = tmpfs_mb
 
     # 1. Read-only mount check (fail-closed if mount output is empty or permission-denied)
@@ -681,6 +694,7 @@ def evaluate_hardware_and_fs_triage(
     chas_alarms = transport.run_command("show chassis alarms")
     sys_alarms = transport.run_command("show system alarms")
     (evidence_dir / "chassis_environment.txt").write_text(env_out, encoding="utf-8")
+    (evidence_dir / "show_system_alarms.txt").write_text(sys_alarms, encoding="utf-8")
 
     alarm_bad = (
         "No alarms currently active" not in chas_alarms
@@ -870,6 +884,492 @@ def evaluate_hardware_and_fs_triage(
     return TriageVerdict.ELIGIBLE, checks
 
 
+def remediate_precheck_issues(
+    transport: SwitchTransport,
+    switch: SwitchRecord,
+    policy: PlatformPolicy,
+    hop: HopSpec,
+    evidence_dir: Path,
+    *,
+    purge_previous_pkg: bool = False,
+    fallback_username: str | None = None,
+    fallback_password: str | None = None,
+    fallback_ssh_key: str | None = None,
+    needs_fallback_user: bool = False,
+    commit_state_clean: bool = True,
+) -> list[str]:
+    """Run safe non-rebooting precheck remediations (storage cleanup, optional fallback user, rescue save, optional pkg purge)."""
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    actions: list[str] = []
+
+    preserve: set[str] | None = None
+    # /tmp/<pkg>.tgz is untouched by `request system storage cleanup no-confirm`;
+    # keeping preserve=None for /tmp/ allows `storage cleanup` to clean /var/tmp.
+    if switch.staged_package and switch.staged_package.startswith("/var/tmp/"):  # nosec B108
+        staged_name = Path(switch.staged_package).name
+        if not hop.package_filename or staged_name == hop.package_filename:
+            preserve = {f"/var/tmp/{staged_name}"}  # nosec B108
+
+    # 1. Clean storage FIRST so rescue save / config commit never fail on a full /.mount
+    parsed_mounts: dict[str, int] = {}
+    free_mb, _ = auto_cleanup_storage(
+        transport,
+        evidence_dir,
+        execute_cleanup=True,
+        preserve_paths=preserve,
+        mounts_out=parsed_mounts,
+    )
+    switch.free_storage_mb = free_mb
+    if parsed_mounts:
+        tmpfs_mb = parsed_mounts.get("/.mount/tmp")
+        if tmpfs_mb is None:
+            tmpfs_mb = parsed_mounts.get("/tmp")
+        switch.tmpfs_free_mb = tmpfs_mb
+
+    preserved = {p.strip() for p in (preserve or set()) if p.strip()}
+    tmp_list_path = evidence_dir / "var_tmp_list.txt"
+    if tmp_list_path.is_file():
+        tmp_list = tmp_list_path.read_text(encoding="utf-8")
+        all_tgz = _extract_safe_var_tmp_tgz_paths(tmp_list)
+        deleted_tgz = [p for p in all_tgz if p not in preserved]
+        kept_tgz = [p for p in all_tgz if p in preserved]
+        if deleted_tgz:
+            actions.append(f"Deleted stale /var/tmp package(s): {', '.join(deleted_tgz)}.")
+        if kept_tgz:
+            actions.append(f"Preserved staged /var/tmp package(s): {', '.join(kept_tgz)}.")
+
+    if any(p.startswith("/var/tmp/") for p in preserved):  # nosec B108
+        actions.append(
+            "Skipped `request system storage cleanup no-confirm` to protect preserved /var/tmp package."
+        )
+    else:
+        actions.append(
+            f"Executed `request system storage cleanup no-confirm` (free={free_mb} MB)."
+        )
+
+    # 2. Optional explicit local SSH fallback super-user creation (only when AAA-only & clean commit state)
+    created_fallback = False
+    if fallback_username:
+        if not needs_fallback_user:
+            actions.append(
+                f"Skipped fallback user '{fallback_username}' (switch already has a local SSH fallback super-user)."
+            )
+        elif not commit_state_clean:
+            actions.append(
+                f"Skipped fallback user '{fallback_username}' (commit state is not clean; resolve pending commit first)."
+            )
+        elif not hasattr(transport, "configure_local_fallback_user"):
+            actions.append(
+                f"Skipped fallback user '{fallback_username}' (transport does not support config commit)."
+            )
+        else:
+            ok_fb, fb_msg = transport.configure_local_fallback_user(
+                fallback_username,
+                password=fallback_password,
+                ssh_public_key=fallback_ssh_key,
+            )
+            (evidence_dir / "fallback_user_fix.txt").write_text(fb_msg + "\n", encoding="utf-8")
+            if ok_fb:
+                created_fallback = True
+            actions.append(fb_msg)
+
+    # 3. Always query LIVE system alarms (never a stale evidence file) before saving rescue config
+    sys_alarms = transport.run_command("show system alarms")
+    if created_fallback or "rescue configuration is not set" in sys_alarms.lower():
+        rescue_out = transport.run_command(
+            "request system configuration rescue save", read_timeout=120
+        )
+        (evidence_dir / "rescue_save_fix.txt").write_text(rescue_out, encoding="utf-8")
+        if _CLI_ERROR_RE.search(rescue_out):
+            actions.append(
+                "Attempted rescue configuration save, but CLI reported an error: "
+                f"{rescue_out.strip()[:160]}"
+            )
+        else:
+            actions.append(
+                "Saved rescue configuration (`request system configuration rescue save`)."
+            )
+
+    # 4. Optional EX2300/EX3400 previous pkg purge (requires root shell privileges)
+    if purge_previous_pkg and (free_mb is None or free_mb < policy.min_free_storage_mb):
+        model_lower = switch.model.lower()
+        if "ex2300" in model_lower or "ex3400" in model_lower or policy.expected_arch == "arm-32":
+            rm_out = transport.run_command(
+                'start shell command "pkg setop rm previous"', read_timeout=120
+            )
+            del_out = transport.run_command(
+                'start shell command "pkg delete old"', read_timeout=120
+            )
+            combined = (
+                "$ pkg setop rm previous\n"
+                f"{rm_out.rstrip()}\n\n"
+                "$ pkg delete old\n"
+                f"{del_out.rstrip()}\n"
+            )
+            (evidence_dir / "pkg_purge_previous.txt").write_text(combined, encoding="utf-8")
+            combined_lower = combined.lower()
+            if (
+                _CLI_ERROR_RE.search(rm_out)
+                or _CLI_ERROR_RE.search(del_out)
+                or "operation not permitted" in combined_lower
+                or "permission denied" in combined_lower
+            ):
+                actions.append(
+                    "Attempted `pkg setop rm previous` / `pkg delete old`, but shell reported an error "
+                    "(requires root shell; run `start shell user root` manually if logged in as a non-root user; "
+                    f"see {evidence_dir / 'pkg_purge_previous.txt'})."
+                )
+            else:
+                actions.append(
+                    "Purged previous Junos pkg set (`pkg setop rm previous` + `pkg delete old`)."
+                )
+            storage_json = transport.run_command("show system storage | display json")
+            if not storage_json.strip().startswith("{"):
+                storage_json = transport.run_command("show system storage")
+            post_free_mb, post_mounts = parse_junos_storage(storage_json)
+            if post_free_mb is not None:
+                switch.free_storage_mb = post_free_mb
+            if post_mounts:
+                tmpfs_mb = post_mounts.get("/.mount/tmp")
+                if tmpfs_mb is None:
+                    tmpfs_mb = post_mounts.get("/tmp")
+                switch.tmpfs_free_mb = tmpfs_mb
+        else:
+            actions.append(
+                f"Skipped `--purge-previous-pkg` (unsupported platform {switch.model}; "
+                "only EX2300/EX3400 arm-32 supported)."
+            )
+    elif purge_previous_pkg:
+        actions.append(
+            f"Skipped `--purge-previous-pkg` (free storage {free_mb} MB already >= "
+            f"{policy.min_free_storage_mb} MB floor)."
+        )
+
+    return actions
+
+
+_AAA_AUTH_METHODS = frozenset({"radius", "tacplus"})
+_LOCAL_USER_AUTH_TYPES = frozenset({"encrypted-password", "ssh-rsa", "ssh-ecdsa", "ssh-ed25519"})
+
+
+def _tokenize_set_line(line: str) -> list[str]:
+    """Split a Junos display-set line respecting quotes, falling back on unbalanced quotes."""
+    try:
+        return shlex.split(line, comments=False)
+    except ValueError:
+        return [tok.strip("\"'") for tok in line.split()]
+
+
+def _extract_auth_order_tokens(raw_tokens: list[str]) -> list[str]:
+    """Normalize Junos authentication-order tokens, handling bracketed lists."""
+    methods: list[str] = []
+    for tok in raw_tokens:
+        cleaned = tok.strip("[]").strip().lower()
+        if cleaned:
+            methods.append(cleaned)
+    return methods
+
+
+def check_local_ssh_fallback(
+    config_set_text: str,
+    allow_aaa_only_ssh: bool = False,
+) -> CheckResult:
+    """Gate AAA-only (RADIUS/TACACS+) configs lacking local super-user or SSH root fallback."""
+    auth_order_methods: set[str] = set()
+    deactivated_auth_methods: set[str] = set()
+    system_deactivated = False
+    auth_order_deactivated = False
+    login_deactivated = False
+    services_deactivated = False
+    ssh_deactivated = False
+    ssh_root_login_deactivated = False
+
+    user_classes: dict[str, str] = {}
+    user_auth_methods: dict[str, set[tuple[str, str]]] = {}
+    deactivated_users: set[str] = set()
+    deactivated_user_class: set[str] = set()
+    deactivated_user_auth: set[str] = set()
+    deactivated_user_auth_types: dict[str, set[str]] = {}
+    deactivated_user_auth_methods: dict[str, set[tuple[str, str]]] = {}
+    root_login_mode: str | None = None
+
+    def _clear_auth_type(
+        mapping: dict[str, set[tuple[str, str]]],
+        user: str,
+        kind: str,
+    ) -> None:
+        entries = mapping.get(user)
+        if entries:
+            entries.difference_update({item for item in entries if item[0] == kind})
+
+    for raw_line in config_set_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        tokens = _tokenize_set_line(stripped)
+        if len(tokens) < 2:
+            continue
+        op = tokens[0].lower()
+        if op not in ("set", "deactivate", "delete"):
+            continue
+        if tokens[1].lower() != "system":
+            continue
+
+        if len(tokens) == 2:
+            if op == "deactivate":
+                system_deactivated = True
+            elif op == "delete":
+                system_deactivated = False
+                auth_order_deactivated = False
+                login_deactivated = False
+                services_deactivated = False
+                ssh_deactivated = False
+                ssh_root_login_deactivated = False
+                auth_order_methods.clear()
+                deactivated_auth_methods.clear()
+                user_classes.clear()
+                user_auth_methods.clear()
+                deactivated_users.clear()
+                deactivated_user_class.clear()
+                deactivated_user_auth.clear()
+                deactivated_user_auth_types.clear()
+                deactivated_user_auth_methods.clear()
+                root_login_mode = None
+            continue
+
+        sub = tokens[2].lower()
+        if sub == "authentication-order":
+            if op == "set" and len(tokens) >= 4:
+                auth_order_methods.update(_extract_auth_order_tokens(tokens[3:]))
+            elif op == "deactivate":
+                if len(tokens) == 3:
+                    auth_order_deactivated = True
+                else:
+                    deactivated_auth_methods.update(_extract_auth_order_tokens(tokens[3:]))
+            elif op == "delete":
+                if len(tokens) == 3:
+                    auth_order_methods.clear()
+                    auth_order_deactivated = False
+                    deactivated_auth_methods.clear()
+                else:
+                    for method in _extract_auth_order_tokens(tokens[3:]):
+                        auth_order_methods.discard(method)
+                        deactivated_auth_methods.discard(method)
+        elif sub == "login":
+            if len(tokens) == 3:
+                if op == "deactivate":
+                    login_deactivated = True
+                elif op == "delete":
+                    login_deactivated = False
+                    user_classes.clear()
+                    user_auth_methods.clear()
+                    deactivated_users.clear()
+                    deactivated_user_class.clear()
+                    deactivated_user_auth.clear()
+                    deactivated_user_auth_types.clear()
+                    deactivated_user_auth_methods.clear()
+            elif len(tokens) >= 5 and tokens[3].lower() == "user":
+                username = tokens[4]
+                if not username:
+                    continue
+                if len(tokens) == 5:
+                    if op == "deactivate":
+                        deactivated_users.add(username)
+                    elif op == "delete":
+                        user_classes.pop(username, None)
+                        user_auth_methods.pop(username, None)
+                        deactivated_users.discard(username)
+                        deactivated_user_class.discard(username)
+                        deactivated_user_auth.discard(username)
+                        deactivated_user_auth_types.pop(username, None)
+                        deactivated_user_auth_methods.pop(username, None)
+                else:
+                    attr = tokens[5].lower()
+                    if attr == "class":
+                        if op == "set" and len(tokens) >= 7:
+                            user_classes[username] = tokens[6].lower()
+                        elif op == "deactivate":
+                            deactivated_user_class.add(username)
+                        elif op == "delete":
+                            user_classes.pop(username, None)
+                            deactivated_user_class.discard(username)
+                    elif attr == "authentication":
+                        if len(tokens) == 6:
+                            if op == "deactivate":
+                                deactivated_user_auth.add(username)
+                            elif op == "delete":
+                                user_auth_methods.pop(username, None)
+                                deactivated_user_auth.discard(username)
+                                deactivated_user_auth_types.pop(username, None)
+                                deactivated_user_auth_methods.pop(username, None)
+                        else:
+                            auth_type = tokens[6].lower()
+                            if auth_type in _LOCAL_USER_AUTH_TYPES:
+                                value = " ".join(
+                                    cleaned
+                                    for tok in tokens[7:]
+                                    if (cleaned := tok.strip(" \t\r\n\"'"))
+                                )
+                                if op == "set":
+                                    if value:
+                                        if auth_type == "encrypted-password":
+                                            _clear_auth_type(
+                                                user_auth_methods, username, auth_type
+                                            )
+                                        user_auth_methods.setdefault(username, set()).add(
+                                            (auth_type, value)
+                                        )
+                                    else:
+                                        _clear_auth_type(user_auth_methods, username, auth_type)
+                                elif op == "deactivate":
+                                    if not tokens[7:]:
+                                        deactivated_user_auth_types.setdefault(
+                                            username, set()
+                                        ).add(auth_type)
+                                    elif value:
+                                        deactivated_user_auth_methods.setdefault(
+                                            username, set()
+                                        ).add((auth_type, value))
+                                elif op == "delete":
+                                    if not tokens[7:]:
+                                        _clear_auth_type(user_auth_methods, username, auth_type)
+                                        _clear_auth_type(
+                                            deactivated_user_auth_methods, username, auth_type
+                                        )
+                                        deactivated_user_auth_types.get(username, set()).discard(
+                                            auth_type
+                                        )
+                                    elif value:
+                                        user_auth_methods.get(username, set()).discard(
+                                            (auth_type, value)
+                                        )
+                                        deactivated_user_auth_methods.get(username, set()).discard(
+                                            (auth_type, value)
+                                        )
+        elif sub == "services":
+            if len(tokens) == 3:
+                if op == "deactivate":
+                    services_deactivated = True
+                elif op == "delete":
+                    services_deactivated = False
+                    ssh_deactivated = False
+                    ssh_root_login_deactivated = False
+                    root_login_mode = None
+            elif len(tokens) >= 4 and tokens[3].lower() == "ssh":
+                if len(tokens) == 4:
+                    if op == "deactivate":
+                        ssh_deactivated = True
+                    elif op == "delete":
+                        ssh_deactivated = False
+                        ssh_root_login_deactivated = False
+                        root_login_mode = None
+                elif len(tokens) >= 5 and tokens[4].lower() == "root-login":
+                    if len(tokens) == 5:
+                        if op == "deactivate":
+                            ssh_root_login_deactivated = True
+                        elif op == "delete":
+                            ssh_root_login_deactivated = False
+                            root_login_mode = None
+                    else:
+                        mode = tokens[5].lower()
+                        if op == "set":
+                            root_login_mode = mode
+                        elif op == "deactivate" and mode == "allow":
+                            ssh_root_login_deactivated = True
+                        elif op == "delete":
+                            if root_login_mode == mode:
+                                root_login_mode = None
+                            if mode == "allow":
+                                ssh_root_login_deactivated = False
+
+    active_auth_order = (
+        set()
+        if (system_deactivated or auth_order_deactivated)
+        else (auth_order_methods - deactivated_auth_methods)
+    )
+    aaa_methods = sorted(m for m in active_auth_order if m in _AAA_AUTH_METHODS)
+
+    fallback_users: list[str] = []
+    if not system_deactivated and not login_deactivated:
+        for username, cls in sorted(user_classes.items()):
+            if cls != "super-user":
+                continue
+            if (
+                username in deactivated_users
+                or username in deactivated_user_class
+                or username in deactivated_user_auth
+            ):
+                continue
+            deact_types = deactivated_user_auth_types.get(username, set())
+            deact_creds = deactivated_user_auth_methods.get(username, set())
+            active_user_auth = {
+                cred
+                for cred in user_auth_methods.get(username, set())
+                if cred[0] not in deact_types and cred not in deact_creds
+            }
+            if active_user_auth:
+                fallback_users.append(username)
+
+    root_login_allow = (
+        root_login_mode == "allow"
+        and not system_deactivated
+        and not services_deactivated
+        and not ssh_deactivated
+        and not ssh_root_login_deactivated
+    )
+
+    details = {
+        "aaa_methods": aaa_methods,
+        "fallback_users": fallback_users,
+        "root_login_allow": root_login_allow,
+    }
+
+    if not aaa_methods:
+        return CheckResult(
+            name="local_ssh_fallback",
+            passed=True,
+            hard_stop=False,
+            severity="info",
+            message=(
+                "No AAA-only SSH lockout risk "
+                "(RADIUS/TACACS+ not active in system authentication-order)."
+            ),
+            details=details,
+        )
+
+    if fallback_users or root_login_allow:
+        sources: list[str] = []
+        if fallback_users:
+            sources.append(f"local super-user(s): {', '.join(fallback_users)}")
+        if root_login_allow:
+            sources.append("services ssh root-login allow")
+        return CheckResult(
+            name="local_ssh_fallback",
+            passed=True,
+            hard_stop=False,
+            severity="info",
+            message=(
+                f"Local SSH fallback verified alongside AAA ({', '.join(aaa_methods)}): "
+                f"{'; '.join(sources)}."
+            ),
+            details=details,
+        )
+
+    return CheckResult(
+        name="local_ssh_fallback",
+        passed=False,
+        hard_stop=not allow_aaa_only_ssh,
+        severity="warn" if allow_aaa_only_ssh else "fail",
+        message=(
+            f"AAA-only SSH lockout risk: system authentication-order uses "
+            f"{', '.join(aaa_methods)} with no active local class super-user authentication "
+            "(encrypted-password/ssh-key) and no `system services ssh root-login allow`. "
+            "Add a local super-user fallback or pass --allow-aaa-only-ssh to override."
+        ),
+        details=details,
+    )
+
+
 def run_prechecks(
     transport: SwitchTransport,
     switch: SwitchRecord,
@@ -883,6 +1383,7 @@ def run_prechecks(
     ignore_old_cores: bool = False,
     allow_no_console: bool = False,
     allow_unverified_checksums: bool = False,
+    allow_aaa_only_ssh: bool = False,
 ) -> list[CheckResult]:
     """Execute release-note, identity, VC, package-match, and hardware/FS triage gates."""
     checks: list[CheckResult] = []
@@ -1023,9 +1524,10 @@ def run_prechecks(
             )
         )
 
-    # 6. Cross-train configuration landmine scan
+    # 6. Cross-train configuration landmine scan & AAA-only SSH lockout gate
     cfg_set = transport.run_command("show configuration | display set | no-more")
     checks.extend(check_config_landmines(cfg_set, evidence_dir=evidence_dir))
+    checks.append(check_local_ssh_fallback(cfg_set, allow_aaa_only_ssh=allow_aaa_only_ssh))
 
     # 7. Package-to-switch compatibility
     chassis_fw = (

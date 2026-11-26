@@ -72,6 +72,8 @@ class FakeJunosTransport:
     pkg_arch_tag: str = "os-runtime-arm-32"
     free_storage_mb: int = 1200
     storage_mount: str = "/.mount"
+    tmpfs_free_mb: int | None = None
+    tmpfs_mount: str = "/.mount/tmp"
     alarms: str = "No alarms currently active"
     sys_alarms: str | None = None
     chas_alarms: str | None = None
@@ -188,32 +190,43 @@ class FakeJunosTransport:
             return "Virtual Chassis ID: 0000.5e00.5301\n0 (FPC 0) Prsnt Master*\n"
         if cmd in ("show system storage | display json", "show system storage"):
             if "json" in cmd:
-                return json.dumps(
+                filesystems = [
                     {
-                        "system-storage-information": [
+                        "filesystem-name": [{"data": "/dev/gpt/junos"}],
+                        "available-blocks": [
                             {
-                                "filesystem": [
-                                    {
-                                        "filesystem-name": [{"data": "/dev/gpt/junos"}],
-                                        "available-blocks": [
-                                            {
-                                                "data": str(self.free_storage_mb * 2048),
-                                                "attributes": {
-                                                    "junos:format": f"{self.free_storage_mb}M"
-                                                },
-                                            }
-                                        ],
-                                        "mounted-on": [{"data": self.storage_mount}],
-                                    }
-                                ]
+                                "data": str(self.free_storage_mb * 2048),
+                                "attributes": {
+                                    "junos:format": f"{self.free_storage_mb}M"
+                                },
                             }
-                        ]
+                        ],
+                        "mounted-on": [{"data": self.storage_mount}],
                     }
-                )
-            return (
+                ]
+                if self.tmpfs_free_mb is not None:
+                    filesystems.append(
+                        {
+                            "filesystem-name": [{"data": "tmpfs"}],
+                            "available-blocks": [
+                                {
+                                    "data": str(self.tmpfs_free_mb * 2048),
+                                    "attributes": {
+                                        "junos:format": f"{self.tmpfs_free_mb}M"
+                                    },
+                                }
+                            ],
+                            "mounted-on": [{"data": self.tmpfs_mount}],
+                        }
+                    )
+                return json.dumps({"system-storage-information": [{"filesystem": filesystems}]})
+            text = (
                 "Filesystem Size Used Avail Capacity Mounted on\n"
                 f"/dev/gpt/junos 1.3G 950M {self.free_storage_mb}M 76% {self.storage_mount}\n"
             )
+            if self.tmpfs_free_mb is not None:
+                text += f"tmpfs 1.0G 0B {self.tmpfs_free_mb}M 0% {self.tmpfs_mount}\n"
+            return text
         if cmd == 'start shell command "mount"':
             return self.mount_output
         if cmd.startswith("show log messages"):
@@ -336,3 +349,26 @@ class FakeJunosTransport:
                 self._post_reboot = True
             return "Reboot the system ? [yes,no] (no) yes\nShutdown NOW!"
         return f"OK: {cmd}"
+
+    def configure_local_fallback_user(
+        self,
+        username: str,
+        *,
+        password: str | None = None,
+        ssh_public_key: str | None = None,
+    ) -> tuple[bool, str]:
+        self.commands_executed.append(f"configure_local_fallback_user:{username}")
+        lines = [f"set system login user {username} class super-user"]
+        if ssh_public_key:
+            lines.append(
+                f'set system login user {username} authentication ssh-ed25519 "{ssh_public_key.strip()}"'
+            )
+        elif password:
+            lines.append(
+                f'set system login user {username} authentication encrypted-password "$6$fakehash"'
+            )
+        extra = "\n".join(lines)
+        self.config_set_extra = (
+            f"{self.config_set_extra}\n{extra}" if self.config_set_extra else extra
+        )
+        return True, f"Configured and committed local super-user fallback '{username}'."

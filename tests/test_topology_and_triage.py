@@ -4,19 +4,28 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import tarfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 from conftest import FakeJunosTransport
 
-from junos_upgrader.checks import evaluate_hardware_and_fs_triage
+from junos_upgrader.checks import (
+    _extract_poe_watts,
+    evaluate_hardware_and_fs_triage,
+    parse_junos_storage,
+    run_postchecks,
+)
+from junos_upgrader.cli import main
 from junos_upgrader.firmware_fetcher import scan_and_ingest_directory
+from junos_upgrader.inventory import load_inventory, save_inventory
 from junos_upgrader.models import NeighborExpectation, SwitchRecord, SwitchState, TriageVerdict
 from junos_upgrader.orchestrator import UpgradeOptions, run_upgrade_batches
-from junos_upgrader.packages import inspect_local_tgz
+from junos_upgrader.packages import extract_switch_arch, inspect_local_tgz
 from junos_upgrader.planner import load_release_catalog, match_platform_policy
 from junos_upgrader.topology import (
     RunnerOrigin,
@@ -520,3 +529,564 @@ def test_firmware_scan_rejects_html_and_ingests_valid_tgz(tmp_path: Path) -> Non
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(f"http://127.0.0.1:{srv.port}{fw_prefix}/../../etc/passwd")
         assert exc_info.value.code in (403, 404)
+
+
+def test_ex3400_sanitized_live_evidence_replay(tmp_path: Path) -> None:
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+
+    show_version_json = json.dumps(
+        {
+            "multi-routing-engine-results": [
+                {
+                    "multi-routing-engine-item": [
+                        {
+                            "re-name": [{"data": "fpc0"}],
+                            "software-information": [
+                                {
+                                    "host-name": [{"data": "LAB-EX3400-01"}],
+                                    "product-model": [{"data": "ex3400-48p"}],
+                                    "junos-version": [{"data": "18.1R3-S12.2"}],
+                                    "package-information": [
+                                        {
+                                            "name": [{"data": "junos-ex-3400"}],
+                                            "comment": [{"data": "JUNOS EX  Software Suite [18.1R3-S12.2]"}],
+                                        },
+                                        {
+                                            "name": [{"data": "os-kernel"}],
+                                            "comment": [{"data": "JUNOS OS Kernel 32-bit [20201105]"}],
+                                        },
+                                        {
+                                            "name": [{"data": "os-runtime-arm-32"}],
+                                            "comment": [{"data": "JUNOS OS Runtime 32-bit"}],
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    assert extract_switch_arch(show_version_json) == "arm-32"
+
+    # Also verify "name"-only detection + defensive handling of [] / None fields
+    name_only_evo_json = json.dumps(
+        {
+            "software-information": [
+                {
+                    "product-model": [{"data": "generic-switch"}],
+                    "package-information": [
+                        {"package-name": [], "name": None, "comment": None},
+                        {
+                            "package-name": [],
+                            "name": [{"data": "junos-evo-install-ptx-fixed-x86-64-23.4R2"}],
+                            "comment": [],
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    assert extract_switch_arch(name_only_evo_json) == "junos-evo"
+
+    name_only_arm32_json = json.dumps(
+        {
+            "software-information": [
+                {
+                    "product-model": [{"data": "unknown-model"}],
+                    "package-information": [
+                        {
+                            "name": [{"data": "os-runtime-arm-32"}],
+                            "comment": [{"data": ""}],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert extract_switch_arch(name_only_arm32_json) == "arm-32"
+
+    # Also verify multi-routing-engine-results formatted as a dict + "name"-keyed arch extraction
+    multi_re_dict_json = json.dumps(
+        {
+            "multi-routing-engine-results": {
+                "multi-routing-engine-item": {
+                    "re-name": {"data": "fpc0"},
+                    "software-information": {
+                        "product-model": {"data": "unknown-model"},
+                        "package-information": {
+                            "name": {"data": "os-runtime-arm-32"},
+                            "comment": {"data": ""},
+                        },
+                    },
+                }
+            }
+        }
+    )
+    assert extract_switch_arch(multi_re_dict_json) == "arm-32"
+
+    storage_with_tmpfs = json.dumps(
+        {
+            "multi-routing-engine-results": [
+                {
+                    "multi-routing-engine-item": [
+                        {
+                            "re-name": [{"data": "fpc0"}],
+                            "system-storage-information": [
+                                {
+                                    "filesystem": [
+                                        {
+                                            "filesystem-name": [{"data": "/dev/gpt/junos"}],
+                                            "available-blocks": [
+                                                {
+                                                    "data": "894976",
+                                                    "attributes": {"junos:format": "437M"},
+                                                }
+                                            ],
+                                            "mounted-on": [{"data": "/.mount"}],
+                                        },
+                                        {
+                                            "filesystem-name": [{"data": "tmpfs"}],
+                                            "available-blocks": [
+                                                {
+                                                    "data": "1859584",
+                                                    "attributes": {"junos:format": "908M"},
+                                                }
+                                            ],
+                                            "mounted-on": [{"data": "/.mount/tmp"}],
+                                        },
+                                        {
+                                            "filesystem-name": [{"data": "tmpfs"}],
+                                            "available-blocks": [
+                                                {
+                                                    "data": "663552",
+                                                    "attributes": {"junos:format": "324M"},
+                                                }
+                                            ],
+                                            "mounted-on": [{"data": "/.mount/mfs"}],
+                                        },
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    parsed_free, parsed_mounts = parse_junos_storage(storage_with_tmpfs)
+    assert parsed_free == 437
+    assert parsed_mounts["/.mount"] == 437
+    assert parsed_mounts["/.mount/tmp"] == 908
+    assert parsed_mounts["/.mount/mfs"] == 324
+
+    mounts_txt = (
+        "/dev/md0.uzip on / (cd9660, local, read-only)\n"
+        "/dev/gpt/junos on /.mount (ufs, local, noatime, soft-updates)\n"
+        "tmpfs on /.mount/tmp (tmpfs, local)\n"
+        "devfs on /dev (devfs, local)\n"
+        "/var/jail on /.mount/var/jail (nullfs, local)\n"
+        "procfs on /proc (procfs, local)\n"
+    )
+    snapshot_txt = (
+        "fpc0:\n"
+        "--------------------------------------------------------------------------\n"
+        "Recovery Snapshots:\n"
+        "Snapshots available on the OAM volume:\n"
+        "recovery.ufs\n"
+        "Junos version: 15.1X53-D58.3\n"
+    )
+    optics_txt = (
+        "Physical interface: xe-0/2/0\n"
+        "    Laser bias current                        :  6.420 mA\n"
+        "    Laser output power                        :  0.5800 mW / -2.37 dBm\n"
+        "    Laser receiver power                      :  0.5100 mW / -2.92 dBm\n"
+        "    Laser bias current high alarm             :  Off\n"
+        "    Laser bias current high alarm threshold   :  70.000 mA\n"
+        "    Laser rx power low alarm                  :  Off\n"
+        "    Laser rx power low alarm threshold        :  0.0316 mW / -15.00 dBm\n"
+    )
+    sys_alarms_txt = (
+        "1 alarms currently active\n"
+        "Alarm time               Class  Description\n"
+        "2026-11-20 08:15:00 UTC  Minor  Rescue configuration is not set\n"
+    )
+    chas_alarms_txt = "No alarms currently active\n"
+    chas_env_txt = (
+        "Item                           Status     Measurement\n"
+        "Power FPC 0 Power Supply 0     OK\n"
+        "Power FPC 0 Power Supply 1     Absent\n"
+        "Temp  FPC 0 CPU Sensor         OK         42 degrees C\n"
+    )
+    poe_txt = (
+        "Controller  Maximum   Power         Guard    Management   Status        Lldp\n"
+        "   0**      740W      36.60W          0W     Class        AT_MODE       Disabled\n"
+        "\n"
+        "** Firmware upgrade available for PoE controller.\n"
+        "Use 'request system firmware upgrade poe fpc-slot 0'\n"
+        "to upgrade PoE controller firmware.\n"
+    )
+
+    class _ReplayEx3400Transport(FakeJunosTransport):
+        storage_payload: str = storage_with_tmpfs
+
+        def run_command(self, command: str, read_timeout: int = 60) -> str:
+            cmd = command.strip()
+            if cmd == "show version | display json":
+                return show_version_json
+            if cmd == "show system storage | display json":
+                return self.storage_payload
+            if cmd == 'start shell command "mount"':
+                return mounts_txt
+            if cmd == "show system snapshot media internal":
+                return snapshot_txt
+            if cmd == "show interfaces diagnostics optics":
+                return optics_txt
+            if cmd == "show system alarms":
+                return sys_alarms_txt
+            if cmd == "show chassis alarms":
+                return chas_alarms_txt
+            if cmd == "show chassis environment":
+                return chas_env_txt
+            if cmd == "show poe controller":
+                return poe_txt
+            return super().run_command(command, read_timeout=read_timeout)
+
+    sw = SwitchRecord(
+        site="LAB",
+        hostname="LAB-EX3400-01",
+        management_ip="192.0.2.10",
+        model="ex3400-48p",
+        serial_number="SN_EX3400_01",
+        current_version="18.1R3-S12.2",
+        role="Access",
+        management_method="SSH",
+        mac_address="00:00:5e:00:53:01",
+        state=SwitchState.READY,
+    )
+    tr = _ReplayEx3400Transport(
+        hostname="LAB-EX3400-01",
+        model="ex3400-48p",
+        serial_number="SN_EX3400_01",
+        running_version="18.1R3-S12.2",
+    )
+    verdict, checks = evaluate_hardware_and_fs_triage(
+        tr, sw, pol, tmp_path / "ev", tmp_path / "cfg", execute_cleanup=False
+    )
+    checks_by_name = {c.name: c for c in checks}
+    assert verdict == TriageVerdict.NEEDS_REMEDIATION
+    assert sw.state == SwitchState.READY
+    assert sw.free_storage_mb == 437
+    assert sw.tmpfs_free_mb == 908
+    assert sw.recovery_snapshot == "15.1X53-D58.3"
+    assert checks_by_name["fs_read_write"].passed is True
+    assert checks_by_name["uplink_optics_health"].passed is True
+    assert checks_by_name["chassis_health"].passed is True
+    assert checks_by_name["chassis_health"].severity == "warn"
+
+    # Follow-up triage without /.mount/tmp or /tmp must clear stale tmpfs_free_mb to None
+    tr.storage_payload = json.dumps(
+        {
+            "multi-routing-engine-results": [
+                {
+                    "multi-routing-engine-item": [
+                        {
+                            "system-storage-information": [
+                                {
+                                    "filesystem": [
+                                        {
+                                            "filesystem-name": [{"data": "/dev/gpt/junos"}],
+                                            "available-blocks": [
+                                                {
+                                                    "data": "894976",
+                                                    "attributes": {"junos:format": "437M"},
+                                                }
+                                            ],
+                                            "mounted-on": [{"data": "/.mount"}],
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    evaluate_hardware_and_fs_triage(
+        tr, sw, pol, tmp_path / "ev2", tmp_path / "cfg2", execute_cleanup=False
+    )
+    assert sw.free_storage_mb == 437
+    assert sw.tmpfs_free_mb is None
+
+    # PoE 0** parsing and postcheck replay
+    assert _extract_poe_watts(poe_txt) == pytest.approx(36.60)
+    post_ver_json = json.dumps(
+        {
+            "multi-routing-engine-results": [
+                {
+                    "multi-routing-engine-item": [
+                        {
+                            "re-name": [{"data": "fpc0"}],
+                            "software-information": [
+                                {
+                                    "host-name": [{"data": "LAB-EX3400-01"}],
+                                    "product-model": [{"data": "ex3400-48p"}],
+                                    "junos-version": [{"data": "23.4R2-S8"}],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    pre_baseline = {
+        "show interfaces terse": "ge-0/0/0 up up\nxe-0/2/0 up up\n",
+        "show lldp neighbors": "xe-0/2/0 - 00:00:5e:00:53:02 xe-0/0/1 CORE-SW\n",
+        "show spanning-tree bridge": "  Root ID                           : 32768.00:00:5e:00:53:02\n",
+        "show poe controller": poe_txt,
+        "show ethernet-switching table": (
+            "Ethernet switching table : 2 entries, 2 learned\n"
+            "    default             00:00:5e:00:53:10   D             -           ge-0/0/0.0\n"
+            "    default             00:00:5e:00:53:11   D             -           ge-0/0/1.0\n"
+        ),
+        "show lacp interfaces": "  xe-0/2/0                  Current   Fast periodic Collecting distributing\n",
+        "show configuration | display set | no-more": "set system host-name LAB-EX3400-01\n",
+    }
+    post_baseline = {
+        "show version | display json": post_ver_json,
+        "show version": "Hostname: LAB-EX3400-01\nModel: ex3400-48p\nJunos: 23.4R2-S8\n",
+        "show system alarms": "No alarms currently active\n",
+        "show chassis alarms": "No alarms currently active\n",
+        "show interfaces terse": pre_baseline["show interfaces terse"],
+        "show lldp neighbors": pre_baseline["show lldp neighbors"],
+        "show spanning-tree bridge": pre_baseline["show spanning-tree bridge"],
+        "show poe controller": poe_txt,
+        "show ethernet-switching table": pre_baseline["show ethernet-switching table"],
+        "show lacp interfaces": pre_baseline["show lacp interfaces"],
+        "show configuration | display set | no-more": pre_baseline[
+            "show configuration | display set | no-more"
+        ],
+    }
+    post_checks = run_postchecks(
+        pre_baseline,
+        post_baseline,
+        expected_version="23.4R2-S8",
+        diff_output_path=tmp_path / "config_diff.txt",
+    )
+    post_by_name = {c.name: c for c in post_checks}
+    assert all(c.passed for c in post_checks)
+    assert post_by_name["target_version_active"].passed is True
+    assert post_by_name["poe_delivery_preserved"].passed is True
+    assert "36.6W" in post_by_name["poe_delivery_preserved"].message
+
+
+def test_reset_state_filters_and_preserves_excluded(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    runner = CliRunner()
+
+    def _seed_switches() -> list[SwitchRecord]:
+        return [
+            SwitchRecord(
+                site="SITE_A",
+                hostname="EXCLUDED_EOL",
+                management_ip="192.0.2.10",
+                model="ex4200-48p",
+                serial_number="SN_EOL",
+                current_version="15.1R7",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.EXCLUDED,
+                last_error="EOL family excluded",
+            ),
+            SwitchRecord(
+                site="SITE_A",
+                hostname="EXCLUDED_MANUAL",
+                management_ip="192.0.2.11",
+                model="ex3400-48p",
+                serial_number="SN_MAN",
+                current_version="23.2R2-S3",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.EXCLUDED,
+                last_error="Manual hardware hold",
+            ),
+            SwitchRecord(
+                site="SITE_A",
+                hostname="A_FAIL",
+                management_ip="192.0.2.12",
+                model="ex3400-48p",
+                serial_number="SN_AF",
+                current_version="23.2R2-S3",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.FAILED,
+                last_error="SSH timeout",
+                triage_verdict=TriageVerdict.NEEDS_REMEDIATION.value,
+                triage_reasons=["Minor alarm"],
+            ),
+            SwitchRecord(
+                site="SITE_A",
+                hostname="A_REPL",
+                management_ip="192.0.2.13",
+                model="ex2300-24p",
+                serial_number="SN_AR",
+                current_version="23.4R2.13",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.REPLACE_RECOMMENDED,
+                last_error="Flash error",
+                triage_verdict=TriageVerdict.REPLACE_RECOMMENDED.value,
+                triage_reasons=["Flash I/O"],
+            ),
+            SwitchRecord(
+                site="SITE_A",
+                hostname="A_DONE",
+                management_ip="192.0.2.14",
+                model="ex3400-48p",
+                serial_number="SN_AD",
+                current_version="23.4R2-S8",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.COMPLETED,
+                last_error="",
+            ),
+            SwitchRecord(
+                site="SITE_B",
+                hostname="B_HOLD",
+                management_ip="198.51.100.21",
+                model="ex3400-48p",
+                serial_number="SN_BH",
+                current_version="23.2R2-S3",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.ANCESTOR_HOLD,
+                last_error="Held due to leaf",
+            ),
+            SwitchRecord(
+                site="SITE_B",
+                hostname="B_STAGED",
+                management_ip="198.51.100.22",
+                model="ex3400-48p",
+                serial_number="SN_BS",
+                current_version="23.2R2-S3",
+                role="Access",
+                management_method="SSH",
+                state=SwitchState.STAGED,
+                staged_package="/tmp/junos-arm-32-23.4R2-S8.tgz",  # nosec B108
+                staged_checksum="a" * 32,
+                triage_verdict="eligible",
+                last_error="previous warning",
+            ),
+        ]
+
+    save_inventory(_seed_switches(), manifest_path)
+
+    # 1. --host targeting EXCLUDED switches must NOT reset them
+    for excl_host in ("EXCLUDED_EOL", "EXCLUDED_MANUAL"):
+        res = runner.invoke(
+            main,
+            [
+                "reset-state",
+                "--manifest",
+                str(manifest_path),
+                "--releases",
+                str(RELEASES_YML),
+                "--host",
+                excl_host,
+            ],
+        )
+        assert res.exit_code == 0, res.output
+        assert "No failed, quarantined, or held switches matched your filters." in res.output
+    by_host = {s.hostname: s for s in load_inventory(manifest_path)}
+    assert by_host["EXCLUDED_EOL"].state == SwitchState.EXCLUDED
+    assert by_host["EXCLUDED_EOL"].last_error == "EOL family excluded"
+    assert by_host["EXCLUDED_MANUAL"].state == SwitchState.EXCLUDED
+    assert by_host["EXCLUDED_MANUAL"].last_error == "Manual hardware hold"
+
+    # 2. --site SITE_A resets only A_FAIL and A_REPL; leaves EXCLUDED_*, A_DONE, and SITE_B intact
+    res_site = runner.invoke(
+        main,
+        [
+            "reset-state",
+            "--manifest",
+            str(manifest_path),
+            "--releases",
+            str(RELEASES_YML),
+            "--site",
+            "SITE_A",
+        ],
+    )
+    assert res_site.exit_code == 0, res_site.output
+    by_host = {s.hostname: s for s in load_inventory(manifest_path)}
+    assert by_host["A_FAIL"].state == SwitchState.READY
+    assert by_host["A_FAIL"].last_error == ""
+    assert by_host["A_FAIL"].triage_verdict == ""
+    assert by_host["A_FAIL"].triage_reasons == []
+    assert by_host["A_REPL"].state == SwitchState.READY
+    assert by_host["A_REPL"].triage_verdict == ""
+    assert by_host["A_REPL"].triage_reasons == []
+    assert by_host["EXCLUDED_EOL"].state == SwitchState.EXCLUDED
+    assert by_host["EXCLUDED_MANUAL"].state == SwitchState.EXCLUDED
+    assert by_host["A_DONE"].state == SwitchState.COMPLETED
+    assert by_host["B_HOLD"].state == SwitchState.ANCESTOR_HOLD
+    assert by_host["B_STAGED"].state == SwitchState.STAGED
+
+    # 3. Re-seed and filter by --model ex3400: resets A_FAIL, B_HOLD, B_STAGED (clears staged_*)
+    save_inventory(_seed_switches(), manifest_path)
+    res_model = runner.invoke(
+        main,
+        [
+            "reset-state",
+            "--manifest",
+            str(manifest_path),
+            "--releases",
+            str(RELEASES_YML),
+            "--model",
+            "ex3400",
+        ],
+    )
+    assert res_model.exit_code == 0, res_model.output
+    by_host = {s.hostname: s for s in load_inventory(manifest_path)}
+    assert by_host["A_FAIL"].state == SwitchState.READY
+    assert by_host["B_HOLD"].state == SwitchState.READY
+    assert by_host["B_STAGED"].state == SwitchState.READY
+    assert by_host["B_STAGED"].staged_package == ""
+    assert by_host["B_STAGED"].staged_checksum == ""
+    assert by_host["B_STAGED"].triage_verdict == ""
+    assert by_host["B_STAGED"].triage_reasons == []
+    assert by_host["B_STAGED"].last_error == ""
+    assert by_host["A_REPL"].state == SwitchState.REPLACE_RECOMMENDED
+    assert by_host["EXCLUDED_EOL"].state == SwitchState.EXCLUDED
+    assert by_host["EXCLUDED_MANUAL"].state == SwitchState.EXCLUDED
+    assert by_host["A_DONE"].state == SwitchState.COMPLETED
+
+    # 4. Re-seed and filter by comma-separated hostname + IP (--host A_FAIL,198.51.100.22)
+    save_inventory(_seed_switches(), manifest_path)
+    res_hosts = runner.invoke(
+        main,
+        [
+            "reset-state",
+            "--manifest",
+            str(manifest_path),
+            "--releases",
+            str(RELEASES_YML),
+            "--host",
+            "A_FAIL,198.51.100.22",
+        ],
+    )
+    assert res_hosts.exit_code == 0, res_hosts.output
+    by_host = {s.hostname: s for s in load_inventory(manifest_path)}
+    assert by_host["A_FAIL"].state == SwitchState.READY
+    assert by_host["B_STAGED"].state == SwitchState.READY
+    assert by_host["B_STAGED"].staged_package == ""
+    assert by_host["B_STAGED"].staged_checksum == ""
+    assert by_host["A_REPL"].state == SwitchState.REPLACE_RECOMMENDED
+    assert by_host["B_HOLD"].state == SwitchState.ANCESTOR_HOLD
+    assert by_host["EXCLUDED_EOL"].state == SwitchState.EXCLUDED
+    assert by_host["EXCLUDED_MANUAL"].state == SwitchState.EXCLUDED
+    assert by_host["A_DONE"].state == SwitchState.COMPLETED

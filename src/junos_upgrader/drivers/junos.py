@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import hmac
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from junos_upgrader.checks import (
     backup_configuration,
@@ -52,6 +52,8 @@ _INSTALL_FAIL_TOKENS = (
     "validation failed",
     "installation failed",
     "signature verification failed",
+    "authentication error",
+    "veriexec:",
     "not enough space",
     "no space left",
     "filesystem full",
@@ -88,6 +90,27 @@ _SNAPSHOT_FAIL_TOKENS = (
 )
 
 
+def _validated_staged_delete_path(remote_path: str) -> str | None:
+    """Return a validated /tmp or /var/tmp package file path safe for `file delete`, or None."""
+    if (
+        not remote_path
+        or not remote_path.startswith(("/var/tmp/", "/tmp/"))  # nosec B108
+        or ".." in remote_path
+    ):
+        return None
+    try:
+        clean_remote = validate_cli_target(remote_path, "remote_staged_path")
+        posix = PurePosixPath(clean_remote)
+        if posix.parent.as_posix() not in ("/tmp", "/var/tmp"):  # nosec B108
+            return None
+        if clean_remote != f"{posix.parent.as_posix()}/{posix.name}":
+            return None
+        validate_package_filename(posix.name)
+    except ValueError:
+        return None
+    return clean_remote
+
+
 class JunosSwitchDriver:
     """Junos EX/QFX implementation of the SwitchDriver lifecycle protocol."""
 
@@ -107,6 +130,7 @@ class JunosSwitchDriver:
         ignore_old_cores: bool = False,
         allow_no_console: bool = False,
         allow_unverified_checksums: bool = False,
+        allow_aaa_only_ssh: bool = False,
     ) -> list[CheckResult]:
         return run_prechecks(
             transport=transport,
@@ -121,6 +145,7 @@ class JunosSwitchDriver:
             ignore_old_cores=ignore_old_cores,
             allow_no_console=allow_no_console,
             allow_unverified_checksums=allow_unverified_checksums,
+            allow_aaa_only_ssh=allow_aaa_only_ssh,
         )
 
     def collect_baseline(
@@ -272,17 +297,19 @@ class JunosSwitchDriver:
             read_timeout=900,
         )
         lower_out = install_out.lower()
-        if not lower_out.strip() or any(tok in lower_out for tok in _INSTALL_FAIL_TOKENS):
-            if transfer.remote_staged_path and transfer.remote_staged_path.startswith(
-                ("/var/tmp/", "/tmp/")  # nosec B108
-            ):
+        scan_out = lower_out
+        if "notice: 'pending' set will be activated at next reboot" in lower_out:
+            scan_out = "\n".join(
+                ln for ln in lower_out.splitlines() if not ln.lstrip().startswith("veriexec:")
+            )
+        if not scan_out.strip() or any(tok in scan_out for tok in _INSTALL_FAIL_TOKENS):
+            clean_staged = _validated_staged_delete_path(transfer.remote_staged_path)
+            if clean_staged is not None:
                 try:
-                    transport.run_command(
-                        f"file delete {transfer.remote_staged_path}", read_timeout=30
-                    )
+                    transport.run_command(f"file delete {clean_staged}", read_timeout=30)
                 except Exception:  # noqa: BLE001
                     pass
-            if not lower_out.strip():
+            if not scan_out.strip():
                 return False, "Software add failed: empty response from switch."
             return False, f"Software add failed: {install_out.strip()}"
 

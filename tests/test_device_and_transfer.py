@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
+import random
+import tarfile
 import threading
 import urllib.error
 import urllib.request
@@ -1133,3 +1136,472 @@ def test_verifier_regressions_proceed_no_space_stale_hop_replan_and_ip_normaliza
     assert dummy_handler._is_allowed_firmware_client() is True
     dummy_handler.client_address = ("0:0:0:0:0:0:0:1", 54321)
     assert dummy_handler._is_loopback_client() is True
+
+
+def _create_large_valid_tgz(dest: Path, payload_bytes: int, comment: str = "arm-32") -> tuple[Path, str]:
+    """Create a valid gzipped tar archive >= payload_bytes using incompressible random bytes."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    comment_file = dest.parent / f".comment_{dest.stem}.tmp"
+    blob_file = dest.parent / f".payload_{dest.stem}.bin"
+    comment_file.write_text(comment, encoding="utf-8")
+    blob_file.write_bytes(random.Random(0).randbytes(payload_bytes))
+    try:
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(comment_file, arcname="+COMMENT")
+            tf.add(blob_file, arcname="payload.bin")
+    finally:
+        comment_file.unlink(missing_ok=True)
+        blob_file.unlink(missing_ok=True)
+    return dest, hashlib.md5(dest.read_bytes(), usedforsecurity=False).hexdigest()
+
+
+class _TimeoutHttpCopyTransport(FakeJunosTransport):
+    def run_command(self, command: str, read_timeout: int = 60) -> str:
+        if command.strip().startswith("file copy "):
+            self.commands_executed.append(command)
+            raise TimeoutError("HTTP copy timed out")
+        return super().run_command(command, read_timeout=read_timeout)
+
+
+class _CustomSoftwareAddTransport(FakeJunosTransport):
+    software_add_output: str = ""
+
+    def run_command(self, command: str, read_timeout: int = 60) -> str:
+        if command.strip().startswith("request system software add "):
+            self.commands_executed.append(command)
+            return self.software_add_output
+        return super().run_command(command, read_timeout=read_timeout)
+
+
+def test_tmpfs_http_to_scp_fallback_and_partial_cleanup(tmp_path: Path) -> None:
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    hop = pol.hops[-1]
+
+    fw_dir = tmp_path / "fw"
+    local_pkg, md5_hex, _ = create_valid_tgz(
+        fw_dir / "juniper" / "ex3400" / hop.train / hop.package_filename
+    )
+    hop.checksum = md5_hex
+
+    sw = _sw("TMPFS_FALLBACK_SW", ip="127.0.0.1")
+    sw.free_storage_mb = 437
+    sw.tmpfs_free_mb = 908
+
+    with UnifiedFirmwareServer(firmware_dir=fw_dir, port=0, bind_host="127.0.0.1") as srv:
+        tr_fail = FakeJunosTransport(
+            sw.hostname,
+            sw.model,
+            sw.serial_number,
+            sw.current_version,
+            free_storage_mb=437,
+            tmpfs_free_mb=908,
+            fail_http_copy=True,
+        )
+        out_fail = stage_or_stream_package(
+            tr_fail, sw, pol, hop, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out_fail.mode_used == "scp-tmpfs"
+        assert out_fail.uses_no_copy is True
+        assert out_fail.remote_staged_path == f"/tmp/{hop.package_filename}"
+        assert out_fail.software_add_target == f"/tmp/{hop.package_filename}"
+        assert f"file delete /tmp/{hop.package_filename}" in tr_fail.commands_executed
+        assert tr_fail.scp_uploads == [(local_pkg, f"/tmp/{hop.package_filename}")]
+
+        tr_timeout = _TimeoutHttpCopyTransport(
+            sw.hostname,
+            sw.model,
+            sw.serial_number,
+            sw.current_version,
+            free_storage_mb=437,
+            tmpfs_free_mb=908,
+        )
+        out_timeout = stage_or_stream_package(
+            tr_timeout, sw, pol, hop, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out_timeout.mode_used == "scp-tmpfs"
+        assert out_timeout.uses_no_copy is True
+        assert out_timeout.remote_staged_path == f"/tmp/{hop.package_filename}"
+        assert f"file delete /tmp/{hop.package_filename}" in tr_timeout.commands_executed
+        assert tr_timeout.scp_uploads == [(local_pkg, f"/tmp/{hop.package_filename}")]
+
+
+def test_two_phase_stage_idempotent_and_upgrade_reuses_tmpfs_no_copy(tmp_path: Path) -> None:
+    base_url, policies, exclusions = load_release_catalog(RELEASES_YML)
+    fw_dir = tmp_path / "fw"
+
+    # Case A: EX3400 (prefer_http_stream=False) two-phase stage -> idempotent stage -> upgrade
+    pol34 = match_platform_policy("ex3400-48p", policies)
+    assert pol34 is not None
+    hop34 = pol34.hops[-1]
+    _, md5_34, _ = create_valid_tgz(
+        fw_dir / "juniper" / "ex3400" / hop34.train / hop34.package_filename
+    )
+    hop34.checksum = md5_34
+
+    sw34 = _sw("EX3400_TMPFS", model="ex3400-48p", version="23.2R2-S3", ip="127.0.0.1")
+    tr34 = FakeJunosTransport(
+        sw34.hostname,
+        sw34.model,
+        sw34.serial_number,
+        "23.2R2-S3",
+        free_storage_mb=437,
+        tmpfs_free_mb=908,
+        checksums_by_filename={hop34.package_filename: md5_34},
+    )
+
+    with UnifiedFirmwareServer(firmware_dir=fw_dir, port=0, bind_host="127.0.0.1") as srv:
+        stage_opts = _fast_opts(base_url, tmp_path, fw_dir, stage_only=True)
+        staged1 = upgrade_single_switch(sw34, pol34, exclusions, policies, tr34, stage_opts, server=srv)
+        assert staged1.state == SwitchState.STAGED
+        assert staged1.staged_package == f"/tmp/{hop34.package_filename}"
+        assert any(
+            c.startswith("file copy ") and c.endswith(f"/tmp/{hop34.package_filename}")
+            for c in tr34.commands_executed
+        )
+        assert "request system reboot" not in tr34.commands_executed
+
+        # Idempotent second stage_only=True even if tmpfs_free_mb dropped below threshold
+        tr34.commands_executed.clear()
+        tr34.scp_uploads.clear()
+        tr34.tmpfs_free_mb = 20
+        staged2 = upgrade_single_switch(
+            staged1, pol34, exclusions, policies, tr34, stage_opts, server=srv
+        )
+        assert staged2.state == SwitchState.STAGED
+        assert staged2.staged_package == f"/tmp/{hop34.package_filename}"
+        assert f"file checksum md5 /tmp/{hop34.package_filename}" in tr34.commands_executed
+        assert not any(c.startswith("file copy ") for c in tr34.commands_executed)
+        assert tr34.scp_uploads == []
+
+        # Phase 2 upgrade reuses /tmp/<pkg>.tgz with `no-copy unlink`
+        tr34.commands_executed.clear()
+        tr34.scp_uploads.clear()
+        up_opts = _fast_opts(base_url, tmp_path, fw_dir, auto_cleanup=True)
+        final34 = upgrade_single_switch(staged2, pol34, exclusions, policies, tr34, up_opts, server=srv)
+        assert final34.state == SwitchState.COMPLETED
+        assert final34.hop_history[0]["transfer_mode"] == "pre-staged"
+        assert not any(c.startswith("file copy ") for c in tr34.commands_executed)
+        assert tr34.scp_uploads == []
+        assert (
+            f"request system software add /tmp/{hop34.package_filename} no-copy unlink"
+            in tr34.commands_executed
+        )
+        assert "request system reboot" in tr34.commands_executed
+
+    # Case B: EX2300 (prefer_http_stream=True) idempotent second stage_only=True when tmpfs drops
+    pol23 = match_platform_policy("ex2300-c-12p", policies)
+    assert pol23 is not None
+    hop23 = pol23.hops[-1]
+    _, md5_23, _ = create_valid_tgz(
+        fw_dir / "juniper" / "ex2300" / hop23.train / hop23.package_filename
+    )
+    hop23.checksum = md5_23
+
+    sw23 = _sw("EX2300_TMPFS", model="ex2300-c-12p", version="23.4R2.13", ip="127.0.0.1")
+    tr23 = FakeJunosTransport(
+        sw23.hostname,
+        sw23.model,
+        sw23.serial_number,
+        "23.4R2.13",
+        free_storage_mb=306,
+        tmpfs_free_mb=908,
+        checksums_by_filename={hop23.package_filename: md5_23},
+    )
+    with UnifiedFirmwareServer(firmware_dir=fw_dir, port=0, bind_host="127.0.0.1") as srv:
+        stage_opts = _fast_opts(base_url, tmp_path, fw_dir, stage_only=True)
+        staged23_1 = upgrade_single_switch(
+            sw23, pol23, exclusions, policies, tr23, stage_opts, server=srv
+        )
+        assert staged23_1.state == SwitchState.STAGED
+        assert staged23_1.staged_package == f"/tmp/{hop23.package_filename}"
+
+        tr23.commands_executed.clear()
+        tr23.tmpfs_free_mb = 20
+        staged23_2 = upgrade_single_switch(
+            staged23_1, pol23, exclusions, policies, tr23, stage_opts, server=srv
+        )
+        assert staged23_2.state == SwitchState.STAGED
+        assert staged23_2.staged_package == f"/tmp/{hop23.package_filename}"
+        assert f"file checksum md5 /tmp/{hop23.package_filename}" in tr23.commands_executed
+        assert not any(c.startswith("file copy ") for c in tr23.commands_executed)
+
+
+@pytest.mark.parametrize("large_pkg", [False, True])
+def test_insufficient_tmpfs_boundary_falls_back_to_http_stream_or_var_tmp(
+    tmp_path: Path, large_pkg: bool
+) -> None:
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    fw_dir = tmp_path / "fw"
+
+    pol23 = match_platform_policy("ex2300-c-12p", policies)
+    assert pol23 is not None
+    hop23 = pol23.hops[-1]
+    pkg23_path = fw_dir / "juniper" / "ex2300" / hop23.train / hop23.package_filename
+    if large_pkg:
+        _, md5_23 = _create_large_valid_tgz(pkg23_path, 2 * 1024 * 1024 + 65536)
+    else:
+        _, md5_23, _ = create_valid_tgz(pkg23_path)
+    hop23.checksum = md5_23
+    pkg23_mb_int = int(pkg23_path.stat().st_size / (1024 * 1024))
+    assert pkg23_mb_int == (2 if large_pkg else 0)
+
+    pol34 = match_platform_policy("ex3400-48p", policies)
+    assert pol34 is not None
+    hop34 = pol34.hops[-1]
+    pkg34_path = fw_dir / "juniper" / "ex3400" / hop34.train / hop34.package_filename
+    if large_pkg:
+        _, md5_34 = _create_large_valid_tgz(pkg34_path, 2 * 1024 * 1024 + 65536)
+    else:
+        _, md5_34, _ = create_valid_tgz(pkg34_path)
+    hop34.checksum = md5_34
+    pkg34_mb_int = int(pkg34_path.stat().st_size / (1024 * 1024))
+
+    with UnifiedFirmwareServer(firmware_dir=fw_dir, port=0, bind_host="127.0.0.1") as srv:
+        # EX2300 (prefer_http_stream=True): +63 -> http-stream; +64 -> http-tmpfs
+        sw23 = _sw("EX2300_BOUND", model="ex2300-c-12p", version="23.4R2.13", ip="127.0.0.1")
+        sw23.free_storage_mb = 306
+        sw23.tmpfs_free_mb = pkg23_mb_int + 63
+        tr23 = FakeJunosTransport(sw23.hostname, sw23.model, sw23.serial_number, "23.4R2.13")
+        out23_low = stage_or_stream_package(
+            tr23, sw23, pol23, hop23, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out23_low.mode_used == "http-stream"
+        assert out23_low.uses_no_copy is True
+        assert out23_low.software_add_target.startswith("http://")
+        assert out23_low.remote_staged_path == ""
+
+        sw23.tmpfs_free_mb = pkg23_mb_int + 64
+        out23_ok = stage_or_stream_package(
+            tr23, sw23, pol23, hop23, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out23_ok.mode_used == "http-tmpfs"
+        assert out23_ok.uses_no_copy is True
+        assert out23_ok.remote_staged_path == f"/tmp/{hop23.package_filename}"
+
+        # EX3400 (prefer_http_stream=False): +63 -> /var/tmp/; +64 -> /tmp/
+        sw34 = _sw("EX3400_BOUND", model="ex3400-48p", version="23.2R2-S3", ip="127.0.0.1")
+        sw34.free_storage_mb = 437
+        sw34.tmpfs_free_mb = pkg34_mb_int + 63
+        tr34 = FakeJunosTransport(sw34.hostname, sw34.model, sw34.serial_number, "23.2R2-S3")
+        out34_low = stage_or_stream_package(
+            tr34, sw34, pol34, hop34, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out34_low.mode_used == "http-copy"
+        assert out34_low.uses_no_copy is False
+        assert out34_low.remote_staged_path == f"/var/tmp/{hop34.package_filename}"
+
+        sw34.tmpfs_free_mb = pkg34_mb_int + 64
+        out34_ok = stage_or_stream_package(
+            tr34, sw34, pol34, hop34, fw_dir, srv, external_base_url="", transfer_mode="auto"
+        )
+        assert out34_ok.mode_used == "http-tmpfs"
+        assert out34_ok.uses_no_copy is True
+        assert out34_ok.remote_staged_path == f"/tmp/{hop34.package_filename}"
+
+
+@pytest.mark.parametrize(
+    "fail_out",
+    ["ERROR: Installation failed", "not enough space on /tmp", ""],
+)
+@pytest.mark.parametrize("staged_dir", ["/tmp", "/var/tmp"])
+def test_install_failure_cleans_up_tmp_and_var_tmp(
+    fail_out: str, staged_dir: str
+) -> None:
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    hop = pol.hops[-1]
+    staged_path = f"{staged_dir}/{hop.package_filename}"
+
+    tr = _CustomSoftwareAddTransport("EX3400_FAIL", "ex3400-48p", "SN_FAIL", "23.2R2-S3")
+    tr.software_add_output = fail_out
+    outcome = TransferOutcome(
+        mode_used="http-tmpfs" if staged_dir == "/tmp" else "http-copy",
+        software_add_target=staged_path,
+        uses_no_copy=(staged_dir == "/tmp"),
+        remote_staged_path=staged_path,
+    )
+    ok, msg = JunosSwitchDriver().install_and_reboot(tr, hop, outcome)
+    assert ok is False
+    assert msg
+    assert f"file delete {staged_path}" in tr.commands_executed
+    assert "request system reboot" not in tr.commands_executed
+
+
+def test_http_stream_install_failure_skips_file_delete_and_checksum_failure_cleans_up(
+    tmp_path: Path,
+) -> None:
+    base_url, policies, exclusions = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    hop = pol.hops[-1]
+
+    # 1. http-stream install failure must NOT issue file delete
+    tr_stream = _CustomSoftwareAddTransport("STREAM_FAIL", "ex2300-c-12p", "SN_SF", "23.4R2.13")
+    tr_stream.software_add_output = "ERROR: fetch failed"
+    stream_outcome = TransferOutcome(
+        mode_used="http-stream",
+        software_add_target=f"http://192.0.2.5:8080/{hop.package_filename}",
+        uses_no_copy=True,
+        remote_staged_path="",
+    )
+    ok_stream, _ = JunosSwitchDriver().install_and_reboot(tr_stream, hop, stream_outcome)
+    assert ok_stream is False
+    assert not any(c.startswith("file delete ") for c in tr_stream.commands_executed)
+
+    # 2. Orchestrator checksum failure cleans up newly staged /tmp and /var/tmp in both stage_only modes
+    fw_dir = tmp_path / "fw"
+    _, md5_hex, _ = create_valid_tgz(
+        fw_dir / "juniper" / "ex3400" / hop.train / hop.package_filename
+    )
+    hop.checksum = md5_hex
+
+    for stage_only in (True, False):
+        for use_tmpfs in (True, False):
+            sw = _sw(f"CHK_FAIL_{stage_only}_{use_tmpfs}", version="23.2R2-S3", ip="127.0.0.1")
+            tr = FakeJunosTransport(
+                sw.hostname,
+                sw.model,
+                sw.serial_number,
+                "23.2R2-S3",
+                free_storage_mb=437 if use_tmpfs else 1200,
+                tmpfs_free_mb=908 if use_tmpfs else None,
+                fail_http_copy=True,
+                checksum_override="f" * 32,
+            )
+            opts = _fast_opts(base_url, tmp_path / f"run_{stage_only}_{use_tmpfs}", fw_dir, stage_only=stage_only)
+            res = upgrade_single_switch(sw, pol, exclusions, policies, tr, opts)
+            expected_path = (
+                f"/tmp/{hop.package_filename}" if use_tmpfs else f"/var/tmp/{hop.package_filename}"
+            )
+            assert res.state == SwitchState.FAILED
+            assert res.staged_package == ""
+            assert res.staged_checksum == ""
+            assert f"file delete {expected_path}" in tr.commands_executed
+
+    # 3. Pre-staged corrupt file is cleaned up on verify_staged_checksum failure before re-staging
+    sw_pre = _sw("PRESET_CORRUPT", version="23.2R2-S3", ip="127.0.0.1")
+    sw_pre.staged_package = f"/tmp/{hop.package_filename}"
+    sw_pre.staged_checksum = "a" * 32
+    tr_pre = FakeJunosTransport(
+        sw_pre.hostname,
+        sw_pre.model,
+        sw_pre.serial_number,
+        "23.2R2-S3",
+        free_storage_mb=1200,
+        tmpfs_free_mb=None,
+        fail_http_copy=True,
+        checksum_override="f" * 32,
+    )
+    opts_pre = _fast_opts(base_url, tmp_path / "run_pre", fw_dir, stage_only=False)
+    res_pre = upgrade_single_switch(sw_pre, pol, exclusions, policies, tr_pre, opts_pre)
+    assert res_pre.state == SwitchState.FAILED
+    assert f"file delete /tmp/{hop.package_filename}" in tr_pre.commands_executed
+    assert f"file delete /var/tmp/{hop.package_filename}" in tr_pre.commands_executed
+
+
+def test_veriexec_auth_error_with_pending_notice_succeeds() -> None:
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    hop = pol.hops[-1]
+    staged_path = f"/tmp/{hop.package_filename}"
+    outcome = TransferOutcome(
+        mode_used="http-tmpfs",
+        software_add_target=staged_path,
+        uses_no_copy=True,
+        remote_staged_path=staged_path,
+    )
+
+    # Variant A: colon Authentication error + pending notice
+    tr_a = _CustomSoftwareAddTransport("VERI_A", "ex3400-48p", "SN_VA", "23.2R2-S3")
+    tr_a.software_add_output = (
+        "veriexec: /packages/sets/pending/boot/loader.efi: Authentication error\n"
+        "NOTICE: 'pending' set will be activated at next reboot.\n"
+    )
+    ok_a, _ = JunosSwitchDriver().install_and_reboot(tr_a, hop, outcome)
+    assert ok_a is True
+    assert "request system reboot" in tr_a.commands_executed
+    assert f"file delete {staged_path}" not in tr_a.commands_executed
+
+    # Variant B: `cannot open` + `error:` inside veriexec line + pending notice
+    tr_b = _CustomSoftwareAddTransport("VERI_B", "ex3400-48p", "SN_VB", "23.2R2-S3")
+    tr_b.software_add_output = (
+        "veriexec: cannot open /packages/sets/pending/boot/loader.efi: error: Authentication error\n"
+        "NOTICE: 'pending' set will be activated at next reboot.\n"
+    )
+    ok_b, _ = JunosSwitchDriver().install_and_reboot(tr_b, hop, outcome)
+    assert ok_b is True
+    assert "request system reboot" in tr_b.commands_executed
+
+    # Negative control 1: pending notice absent -> veriexec error fails closed
+    tr_neg1 = _CustomSoftwareAddTransport("VERI_NEG1", "ex3400-48p", "SN_VN1", "23.2R2-S3")
+    tr_neg1.software_add_output = (
+        "veriexec: /packages/sets/pending/boot/loader.efi: error: Authentication error\n"
+    )
+    ok_neg1, _ = JunosSwitchDriver().install_and_reboot(tr_neg1, hop, outcome)
+    assert ok_neg1 is False
+    assert "request system reboot" not in tr_neg1.commands_executed
+    assert f"file delete {staged_path}" in tr_neg1.commands_executed
+
+    # Negative control 2: pending notice present alongside real ERROR: -> fails closed
+    tr_neg2 = _CustomSoftwareAddTransport("VERI_NEG2", "ex3400-48p", "SN_VN2", "23.2R2-S3")
+    tr_neg2.software_add_output = (
+        "veriexec: /packages/sets/pending/boot/loader.efi: Authentication error\n"
+        "NOTICE: 'pending' set will be activated at next reboot.\n"
+        "ERROR: Installation failed\n"
+    )
+    ok_neg2, _ = JunosSwitchDriver().install_and_reboot(tr_neg2, hop, outcome)
+    assert ok_neg2 is False
+    assert "request system reboot" not in tr_neg2.commands_executed
+    assert f"file delete {staged_path}" in tr_neg2.commands_executed
+
+    # Negative control 3: Variant A exact Authentication error line WITHOUT NOTICE -> fails closed
+    tr_neg3 = _CustomSoftwareAddTransport("VERI_NEG3", "ex3400-48p", "SN_VN3", "23.2R2-S3")
+    tr_neg3.software_add_output = (
+        "veriexec: /packages/sets/pending/boot/loader.efi: Authentication error\n"
+    )
+    ok_neg3, _ = JunosSwitchDriver().install_and_reboot(tr_neg3, hop, outcome)
+    assert ok_neg3 is False
+    assert "request system reboot" not in tr_neg3.commands_executed
+    assert f"file delete {staged_path}" in tr_neg3.commands_executed
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/tmp/../etc/passwd",
+        "/tmp/pkg.tgz;reboot",
+        "/var/tmp/",
+        "/tmp/",
+        "/tmp/sub/junos-arm-32-23.4R2-S8.tgz",
+        "/tmp/./junos-arm-32-23.4R2-S8.tgz",
+        "/tmp/not_a_package.txt",
+    ],
+)
+def test_unsafe_remote_staged_path_skips_file_delete(unsafe_path: str) -> None:
+    from junos_upgrader.orchestrator import _cleanup_remote_staged
+
+    _, policies, _ = load_release_catalog(RELEASES_YML)
+    pol = match_platform_policy("ex3400-48p", policies)
+    assert pol is not None
+    hop = pol.hops[-1]
+
+    tr = _CustomSoftwareAddTransport("UNSAFE_DEL", "ex3400-48p", "SN_UD", "23.2R2-S3")
+    tr.software_add_output = "ERROR: Installation failed"
+    bad_outcome = TransferOutcome(
+        mode_used="http-tmpfs",
+        software_add_target=f"/tmp/{hop.package_filename}",
+        uses_no_copy=True,
+        remote_staged_path=unsafe_path,
+    )
+    ok, _ = JunosSwitchDriver().install_and_reboot(tr, hop, bad_outcome)
+    assert ok is False
+    assert "request system reboot" not in tr.commands_executed
+    assert not any(c.startswith("file delete ") for c in tr.commands_executed)
+
+    tr_clean = FakeJunosTransport("UNSAFE_ORCH", "ex3400-48p", "SN_UO", "23.2R2-S3")
+    _cleanup_remote_staged(tr_clean, unsafe_path)
+    assert tr_clean.commands_executed == []

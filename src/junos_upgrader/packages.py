@@ -12,6 +12,7 @@ import tarfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from junos_upgrader.models import CheckResult, HopSpec, PlatformPolicy, SwitchRecord
 from junos_upgrader.planner import is_safe_package_filename, parse_junos_version_key
@@ -63,15 +64,39 @@ class PackageMetadata:
     sha1: str = ""
 
 
+def _first_json_data(node: Any) -> str:
+    """Extract string `data` from Junos JSON scalar, dict, or list-of-dict nodes."""
+    if isinstance(node, list):
+        if not node:
+            return ""
+        first = node[0]
+        if isinstance(first, dict):
+            val = first.get("data", "")
+            return "" if val is None else str(val)
+        return "" if first is None else str(first)
+    if isinstance(node, dict):
+        val = node.get("data", "")
+        return "" if val is None else str(val)
+    if isinstance(node, str):
+        return node
+    return ""
+
+
 def extract_switch_arch(version_output: str) -> str:
     """Extract running Junos hardware/kernel architecture from `show version` output."""
     text = version_output.strip()
     if text.startswith("{"):
         try:
             data = json.loads(text)
+            if not isinstance(data, dict):
+                data = {}
             if "multi-routing-engine-results" in data:
                 re_results = data["multi-routing-engine-results"]
-                re_entry = re_results[0] if isinstance(re_results, list) and re_results else {}
+                re_entry = (
+                    re_results[0]
+                    if isinstance(re_results, list) and re_results
+                    else (re_results if isinstance(re_results, dict) else {})
+                )
                 items = (
                     re_entry.get("multi-routing-engine-item", [])
                     if isinstance(re_entry, dict)
@@ -99,23 +124,25 @@ def extract_switch_arch(version_output: str) -> str:
                     if isinstance(sw_node, list) and sw_node
                     else (sw_node if isinstance(sw_node, dict) else {})
                 )
-            prod = sw_info.get("product-model", [{}])
-            model_node = (
-                prod[0]
-                if isinstance(prod, list) and prod
-                else (prod if isinstance(prod, dict) else {})
-            )
-            model = str(model_node.get("data", "")).lower()
+            if not isinstance(sw_info, dict):
+                sw_info = {}
+            model = _first_json_data(sw_info.get("product-model")).lower()
             raw_pkgs = sw_info.get("package-information", [])
             if isinstance(raw_pkgs, dict):
                 raw_pkgs = [raw_pkgs]
-            pkgs = " ".join(
-                str(p.get("package-name", [{}])[0].get("data", ""))
-                + " "
-                + str(p.get("comment", [{}])[0].get("data", ""))
-                for p in raw_pkgs
-                if isinstance(p, dict)
-            ).lower()
+            elif not isinstance(raw_pkgs, list):
+                raw_pkgs = []
+            pkg_parts: list[str] = []
+            for p in raw_pkgs:
+                if not isinstance(p, dict):
+                    continue
+                pkg_name = _first_json_data(p.get("package-name")) or _first_json_data(
+                    p.get("name")
+                )
+                comment = _first_json_data(p.get("comment"))
+                if pkg_name or comment:
+                    pkg_parts.append(f"{pkg_name} {comment}".strip())
+            pkgs = " ".join(pkg_parts).lower()
             return _classify_arch(model, pkgs)
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             pass

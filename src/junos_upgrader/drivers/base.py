@@ -30,6 +30,7 @@ class SwitchDriver(Protocol):
         ignore_old_cores: bool = False,
         allow_no_console: bool = False,
         allow_unverified_checksums: bool = False,
+        allow_aaa_only_ssh: bool = False,
     ) -> list[CheckResult]: ...
 
     def collect_baseline(

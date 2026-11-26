@@ -19,6 +19,42 @@ _INTERACTIVE_CONFIRM_RE = re.compile(
     re.IGNORECASE,
 )
 _CLI_PROMPT_RE = r"[>#%]\s*$"
+_FALLBACK_USERNAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9._-]{0,31}$")
+_SSH_PUBKEY_TYPE_MAP: dict[str, str] = {
+    "ssh-rsa": "ssh-rsa",
+    "ssh-ed25519": "ssh-ed25519",
+    "ecdsa-sha2-nistp256": "ssh-ecdsa",
+    "ecdsa-sha2-nistp384": "ssh-ecdsa",
+    "ecdsa-sha2-nistp521": "ssh-ecdsa",
+}
+
+
+def validate_fallback_username(username: str) -> str:
+    """Validate a Junos local fallback username (rejects root and shell/CLI metacharacters)."""
+    clean = username.strip()
+    if not clean or clean.lower() == "root" or not _FALLBACK_USERNAME_RE.fullmatch(clean):
+        raise ValueError(
+            f"Invalid fallback username {username!r}: must match ^[a-zA-Z_][a-zA-Z0-9._-]{{0,31}}$ "
+            "and must not be 'root'."
+        )
+    return clean
+
+
+def parse_ssh_public_key(raw_key: str) -> tuple[str, str]:
+    """Validate an OpenSSH public key line and return (junos_auth_type, sanitized_key_line)."""
+    lines = [ln.strip() for ln in raw_key.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if len(lines) != 1:
+        raise ValueError("SSH public key file must contain exactly one public key line.")
+    key_line = lines[0]
+    if any(ch in key_line for ch in ('"', "'", "`", "$", ";", "|", "&", "\r", "\n")):
+        raise ValueError("SSH public key contains disallowed CLI metacharacters.")
+    parts = key_line.split()
+    if len(parts) < 2 or parts[0] not in _SSH_PUBKEY_TYPE_MAP:
+        raise ValueError(
+            f"Unsupported SSH public key type {parts[0] if parts else ''!r} "
+            f"(supported: {', '.join(sorted(_SSH_PUBKEY_TYPE_MAP))})."
+        )
+    return _SSH_PUBKEY_TYPE_MAP[parts[0]], f"{parts[0]} {parts[1]}"
 
 
 def _is_placeholder_password(password: str) -> bool:
@@ -220,14 +256,29 @@ class NetmikoJunosTransport:
                 params["use_keys"] = True
                 params["key_file"] = os.path.expanduser(cred.key_file)
             elif not cred.password:
-                params["use_keys"] = True
+                params["allow_agent"] = True
             if cred.password:
                 params["password"] = cred.password
 
             try:
                 try:
                     self._conn = ConnectHandler(**params)
-                except (NetmikoAuthenticationException, NetmikoTimeoutException):
+                except NetmikoAuthenticationException as auth_exc:
+                    # If an explicit key_file is passphrase-protected on disk, retry via ssh-agent
+                    if (
+                        "key_file" in params
+                        and "private key file is encrypted" in str(auth_exc).lower()
+                        and os.environ.get("SSH_AUTH_SOCK")
+                    ):
+                        agent_params = {
+                            k: v for k, v in params.items() if k not in ("key_file", "use_keys")
+                        }
+                        agent_params["use_keys"] = False
+                        agent_params["allow_agent"] = True
+                        self._conn = ConnectHandler(**agent_params)
+                    else:
+                        raise
+                except NetmikoTimeoutException:
                     raise
                 except SSHException:
                     # Fallback for legacy Junos 17.x/18.x SSH servers on Paramiko 4.0
@@ -327,6 +378,96 @@ class NetmikoJunosTransport:
             scp.scp_put_file(str(local_path), remote_path)
         finally:
             scp.close()
+
+    def configure_local_fallback_user(
+        self,
+        username: str,
+        *,
+        password: str | None = None,
+        ssh_public_key: str | None = None,
+    ) -> tuple[bool, str]:
+        """Configure and commit a local super-user SSH fallback account on Junos."""
+        if self._conn is None:
+            raise RuntimeError("Transport is not connected")
+        clean_user = validate_fallback_username(username)
+        if not password and not ssh_public_key:
+            raise ValueError("Either password or ssh_public_key is required for fallback user.")
+        if password and any(ch in password for ch in ("\r", "\n")):
+            raise ValueError("Fallback password must not contain newline characters.")
+
+        key_type = ""
+        clean_key = ""
+        if ssh_public_key:
+            key_type, clean_key = parse_ssh_public_key(ssh_public_key)
+
+        try:
+            self._conn.config_mode(config_command="configure exclusive")
+            self._conn.send_command(
+                f"set system login user {clean_user} class super-user",
+                expect_string=r"#\s*$",
+                read_timeout=30,
+            )
+            if clean_key:
+                self._conn.send_command(
+                    f'set system login user {clean_user} authentication {key_type} "{clean_key}"',
+                    expect_string=r"#\s*$",
+                    read_timeout=30,
+                )
+            if password:
+                self._conn.send_command(
+                    f"set system login user {clean_user} authentication plain-text-password",
+                    expect_string=r"(?:New password:|#\s*$)",
+                    strip_prompt=False,
+                    strip_command=False,
+                    read_timeout=30,
+                )
+                self._conn.send_command(
+                    password,
+                    expect_string=r"(?:Retype new password:|#\s*$)",
+                    strip_prompt=False,
+                    strip_command=False,
+                    read_timeout=30,
+                    cmd_verify=False,
+                )
+                self._conn.send_command(
+                    password,
+                    expect_string=r"#\s*$",
+                    strip_prompt=False,
+                    strip_command=False,
+                    read_timeout=30,
+                    cmd_verify=False,
+                )
+
+            check_out = str(
+                self._conn.send_command(
+                    "commit check",
+                    expect_string=r"#\s*$",
+                    read_timeout=120,
+                )
+            )
+            if "configuration check succeeds" not in check_out.lower() or "error:" in check_out.lower():
+                self._conn.send_command("rollback 0", expect_string=r"#\s*$", read_timeout=30)
+                self._conn.exit_config_mode()
+                return False, f"commit check failed (rolled back): {check_out.strip()}"
+
+            commit_out = str(
+                self._conn.send_command(
+                    'commit comment "junos-upgrader: add local SSH fallback super-user"',
+                    expect_string=r"#\s*$",
+                    read_timeout=120,
+                )
+            )
+            self._conn.exit_config_mode()
+            if "commit complete" not in commit_out.lower() or "error:" in commit_out.lower():
+                return False, f"commit failed: {commit_out.strip()}"
+            return True, f"Configured and committed local super-user fallback '{clean_user}'."
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self._conn.send_command("rollback 0", expect_string=r"#\s*$", read_timeout=15)
+                self._conn.exit_config_mode()
+            except Exception:  # noqa: BLE001
+                pass
+            return False, f"Failed configuring fallback user '{clean_user}': {exc}"
 
     def is_reachable(self, timeout: float = 3.0) -> bool:
         try:

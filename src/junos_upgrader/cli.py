@@ -8,6 +8,7 @@ import importlib.resources
 import ipaddress
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -22,9 +23,13 @@ from rich.table import Table
 
 from junos_upgrader import __version__
 from junos_upgrader.checks import (
+    TRIAGE_CHECKS,
     backup_configuration,
+    check_local_ssh_fallback,
     collect_baseline,
+    evaluate_hardware_and_fs_triage,
     generate_recovery_sheet,
+    remediate_precheck_issues,
     run_prechecks,
 )
 from junos_upgrader.firmware_fetcher import (
@@ -47,6 +52,8 @@ from junos_upgrader.junos_client import (
     NetmikoJunosTransport,
     SwitchTransport,
     load_credentials,
+    parse_ssh_public_key,
+    validate_fallback_username,
 )
 from junos_upgrader.models import (
     PlatformPolicy,
@@ -940,6 +947,42 @@ def plan_cmd(
     is_flag=True,
     help="Allow placeholder/unverified package checksums (lab use only)",
 )
+@click.option(
+    "--allow-aaa-only-ssh",
+    is_flag=True,
+    help="Allow AAA-only (RADIUS/TACACS+) auth without a local super-user SSH fallback",
+)
+@click.option(
+    "--fix",
+    is_flag=True,
+    default=False,
+    help="Run safe non-rebooting remediations (rescue save, storage cleanup, stale /var/tmp/*.tgz purge) and re-evaluate triage",
+)
+@click.option(
+    "--purge-previous-pkg",
+    is_flag=True,
+    default=False,
+    help="With --fix, purge previous Junos pkg set (`pkg setop rm previous` / `pkg delete old`) on EX2300/EX3400 if storage remains below floor",
+)
+@click.option(
+    "--create-fallback-user",
+    default=None,
+    help="With --fix, explicitly create a local super-user SSH fallback account on AAA-only switches (requires confirmation)",
+)
+@click.option(
+    "--fallback-ssh-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to OpenSSH public key (.pub) for --create-fallback-user (if omitted, prompts for hidden password or uses JUNOS_FALLBACK_PASSWORD)",
+)
+@click.option(
+    "-y",
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip interactive confirmation prompt for --create-fallback-user",
+)
 def precheck_cmd(
     manifest: Path,
     releases: Path | None,
@@ -958,8 +1001,49 @@ def precheck_cmd(
     ignore_old_cores: bool,
     allow_no_console: bool,
     allow_unverified_checksums: bool,
+    allow_aaa_only_ssh: bool,
+    fix: bool,
+    purge_previous_pkg: bool,
+    create_fallback_user: str | None,
+    fallback_ssh_key: Path | None,
+    assume_yes: bool,
 ) -> None:
-    """Run live read-only pre-upgrade health/FS triage, landmine scan, and recovery.txt export."""
+    """Run live pre-upgrade health/FS triage, landmine scan, and recovery.txt export (read-only by default; use --fix for safe remediation)."""
+    if purge_previous_pkg and not fix:
+        raise click.ClickException("--purge-previous-pkg requires --fix.")
+    if create_fallback_user and not fix:
+        raise click.ClickException("--create-fallback-user requires --fix.")
+    if fallback_ssh_key and not create_fallback_user:
+        raise click.ClickException("--fallback-ssh-key requires --create-fallback-user.")
+
+    clean_fb_user: str | None = None
+    fb_password: str | None = None
+    fb_ssh_key_text: str | None = None
+    if create_fallback_user:
+        try:
+            clean_fb_user = validate_fallback_username(create_fallback_user)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if fallback_ssh_key is not None:
+            try:
+                raw_pub = fallback_ssh_key.read_text(encoding="utf-8")
+                parse_ssh_public_key(raw_pub)
+                fb_ssh_key_text = raw_pub
+            except (OSError, ValueError) as exc:
+                raise click.ClickException(f"Invalid --fallback-ssh-key: {exc}") from exc
+        else:
+            env_pw = os.environ.get("JUNOS_FALLBACK_PASSWORD")
+            if env_pw:
+                fb_password = env_pw
+            else:
+                fb_password = click.prompt(
+                    f"Password for local fallback super-user '{clean_fb_user}'",
+                    hide_input=True,
+                    confirmation_prompt=True,
+                )
+            if not fb_password or any(ch in fb_password for ch in ("\r", "\n")):
+                raise click.ClickException("Fallback user password must be non-empty and single-line.")
+
     releases_path = _resolve_releases_arg(releases)
     _, policies, exclusions = load_release_catalog(releases_path)
     switches = _load_inventory_or_exit(manifest)
@@ -973,6 +1057,29 @@ def precheck_cmd(
             )
         console.print("[yellow]No eligible switches matched your filters.[/yellow]")
         return
+
+    if clean_fb_user and not assume_yes:
+        auth_desc = f"SSH public key ({fallback_ssh_key})" if fb_ssh_key_text else "password (hidden)"
+        host_preview = ", ".join(sw.hostname for sw in targets[:10])
+        if len(targets) > 10:
+            host_preview += f", ... (+{len(targets) - 10} more)"
+        console.print(
+            Panel(
+                f"Local super-user to create (ONLY on AAA-only switches missing one): "
+                f"[bold]{rich_escape(clean_fb_user)}[/bold]\n"
+                f"Authentication method: {rich_escape(auth_desc)}\n"
+                f"Target switch(es) ({len(targets)}): {rich_escape(host_preview)}\n"
+                "Commands: `configure exclusive` -> `set system login user <user> class super-user` "
+                "-> `commit check` -> `commit` -> `request system configuration rescue save`",
+                title="EXPLICIT APPROVAL REQUIRED: LOCAL SSH FALLBACK ACCOUNT",
+                border_style="yellow",
+            )
+        )
+        if not click.confirm(
+            f"Approve creating local super-user '{clean_fb_user}' on eligible AAA-only switches?",
+            default=False,
+        ):
+            raise click.ClickException("Aborted by operator (fallback user creation not approved).")
 
     _warn_if_bleeding_edge(policies, targets=targets)
     creds = _load_creds_or_exit(credentials_file, username, password, password_stdin, key_file)
@@ -1036,16 +1143,72 @@ def precheck_cmd(
                 ignore_old_cores=ignore_old_cores,
                 allow_no_console=allow_no_console,
                 allow_unverified_checksums=allow_unverified_checksums,
+                allow_aaa_only_ssh=allow_aaa_only_ssh,
             )
+            active_hop = hops[0]
             if sw.current_version != pre_ver:
                 try:
                     refresh_switch_plan(sw, policies, exclusions)
                 except ValueError as exc:
                     sw.last_error = f"Version refresh plan error: {exc}"
+                else:
+                    try:
+                        new_hops = compute_remaining_hops(sw.current_version, policy)
+                    except ValueError as exc:
+                        sw.last_error = f"Version refresh hop error: {exc}"
+                    else:
+                        if new_hops:
+                            active_hop = new_hops[0]
 
             identity_failed = any(
                 c.name == "identity_and_version" and not c.passed and c.hard_stop for c in checks
             )
+            if (
+                fix
+                and not identity_failed
+                and sw.state not in (SwitchState.REPLACE_RECOMMENDED, SwitchState.COMPLETED)
+            ):
+                needs_fb = any(
+                    c.name == "local_ssh_fallback" and not c.passed for c in checks
+                )
+                commit_clean = not any(
+                    c.name == "clean_commit_state" and not c.passed for c in checks
+                )
+                actions = remediate_precheck_issues(
+                    transport,
+                    sw,
+                    policy,
+                    active_hop,
+                    ev,
+                    purge_previous_pkg=purge_previous_pkg,
+                    fallback_username=clean_fb_user,
+                    fallback_password=fb_password,
+                    fallback_ssh_key=fb_ssh_key_text,
+                    needs_fallback_user=needs_fb,
+                    commit_state_clean=commit_clean,
+                )
+                for action in actions:
+                    console.print(
+                        f"  [cyan]FIX[/cyan] {rich_escape(sw.hostname)}: {rich_escape(action)}"
+                    )
+                _, triage_checks = evaluate_hardware_and_fs_triage(
+                    transport,
+                    sw,
+                    policy,
+                    evidence_dir=ev,
+                    config_root=config_dir,
+                    execute_cleanup=False,
+                    ignore_old_cores=ignore_old_cores,
+                    expected_hop_filename=active_hop.package_filename,
+                )
+                checks = [c for c in checks if c.name not in TRIAGE_CHECKS] + triage_checks
+                if clean_fb_user and needs_fb:
+                    fresh_cfg = transport.run_command("show configuration | display set | no-more")
+                    fb_res = check_local_ssh_fallback(
+                        fresh_cfg, allow_aaa_only_ssh=allow_aaa_only_ssh
+                    )
+                    checks = [c for c in checks if c.name != "local_ssh_fallback"] + [fb_res]
+
             if not identity_failed:
                 baseline = collect_baseline(transport, ev)
                 cfg_dir = ensure_within_directory(
@@ -1081,10 +1244,10 @@ def precheck_cmd(
                 f"{rich_escape(sw.hostname)}: " + rich_escape("; ".join(c.message for c in bad))
             )
         else:
-            if sw.state == SwitchState.FAILED:
+            if sw.state in (SwitchState.FAILED, SwitchState.NOT_READY):
                 sw.state = SwitchState.READY
             sw.last_error = ""
-            next_label = sw.next_hop or hops[0].target_version
+            next_label = sw.next_hop or active_hop.target_version
             mode_hint = "http-stream (no-copy)" if policy.prefer_http_stream else "http/scp"
             console.print(
                 f"[green]PASS[/green] {rich_escape(sw.hostname)} "
@@ -1181,6 +1344,11 @@ def precheck_cmd(
     is_flag=True,
     help="Allow placeholder/unverified package checksums (lab use only)",
 )
+@click.option(
+    "--allow-aaa-only-ssh",
+    is_flag=True,
+    help="Allow AAA-only (RADIUS/TACACS+) auth without a local super-user SSH fallback",
+)
 def stage_cmd(
     manifest: Path,
     releases: Path | None,
@@ -1210,6 +1378,7 @@ def stage_cmd(
     accept_bleeding_edge: bool,
     skip_release_notes_gate: bool,
     allow_unverified_checksums: bool,
+    allow_aaa_only_ssh: bool,
 ) -> None:
     """Two-phase business-hours staging: copy & verify next hop without rebooting."""
     try:
@@ -1260,6 +1429,7 @@ def stage_cmd(
         allow_no_console=allow_no_console,
         accept_bleeding_edge=accept_bleeding_edge,
         allow_unverified_checksums=allow_unverified_checksums,
+        allow_aaa_only_ssh=allow_aaa_only_ssh,
         state_lock=state_lock,
     )
 
@@ -1417,6 +1587,11 @@ def stage_cmd(
     help="Allow placeholder/unverified package checksums (lab use only)",
 )
 @click.option(
+    "--allow-aaa-only-ssh",
+    is_flag=True,
+    help="Allow AAA-only (RADIUS/TACACS+) auth without a local super-user SSH fallback",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Live SSH triage, cleanup preview & backup; skip software add & reboot",
@@ -1454,6 +1629,7 @@ def upgrade_cmd(
     skip_release_notes_gate: bool,
     accept_bleeding_edge: bool,
     allow_unverified_checksums: bool,
+    allow_aaa_only_ssh: bool,
     dry_run: bool,
 ) -> None:
     """Target switches leaf-first across topology waves and upgrade hop-by-hop until current."""
@@ -1507,6 +1683,7 @@ def upgrade_cmd(
         refresh_snapshot=refresh_snapshot,
         accept_bleeding_edge=accept_bleeding_edge,
         allow_unverified_checksums=allow_unverified_checksums,
+        allow_aaa_only_ssh=allow_aaa_only_ssh,
         state_lock=state_lock,
         dry_run=dry_run,
     )
